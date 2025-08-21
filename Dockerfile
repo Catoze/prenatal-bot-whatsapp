@@ -18,4 +18,4 @@ COPY . /app
 ENV PORT=8000
 EXPOSE 8000
 
-CMD ["gunicorn", "app:app", "--bind", "0.0.0.0:${PORT}"]
+CMD ["sh","-c","gunicorn app:app --bind 0.0.0.0:$PORT"]
