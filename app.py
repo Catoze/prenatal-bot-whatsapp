@@ -1,14 +1,4 @@
-# Write a revised app.py with:
-# - Root ("/") route to avoid 404 on homepage
-# - Custom 404 handler using templates/404.html
-# - export.csv improved for Excel (UTF-8 BOM, configurable delimiter via ?sep=; default ';')
-# - Everything else unchanged functionally
-# Also create templates/404.html
 
-from pathlib import Path
-from textwrap import dedent
-
-app_py_v2 = dedent('''
 import os
 import json
 import sqlite3
@@ -34,7 +24,7 @@ def db():
 def init_db():
     conn = db()
     cur = conn.cursor()
-    cur.execute(\"\"\"
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             phone TEXT PRIMARY KEY,
             state INTEGER NOT NULL,
@@ -43,8 +33,8 @@ def init_db():
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
-    \"\"\")
-    cur.execute(\"\"\"
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
@@ -53,7 +43,7 @@ def init_db():
             ga_weeks INTEGER,
             created_at TEXT NOT NULL
         )
-    \"\"\")
+    """)
     conn.commit()
     conn.close()
 
@@ -65,16 +55,16 @@ init_db()
 SEVERE_SYMPTOM_IDS = {"1","2","3","4","6"}  # flags for urgent care
 
 WELCOME = (
-    "Olá! Sou o assistente *Pré-Natal* da pesquisa.\\n\\n"
+    "Olá! Sou o assistente *Pré-Natal* da pesquisa.\n\n"
     "*Aviso importante*: este serviço NÃO substitui atendimento médico. "
-    "Em emergência, ligue 192 (SAMU).\\n\\n"
-    "Se você *concorda em participar* e autoriza o uso dos dados para fins acadêmicos conforme a LGPD, responda:\\n"
-    "*ACEITO*\\n\\n"
+    "Em emergência, ligue 192 (SAMU).\n\n"
+    "Se você *concorda em participar* e autoriza o uso dos dados para fins acadêmicos conforme a LGPD, responda:\n"
+    "*ACEITO*\n\n"
     "Para sair a qualquer momento, digite: SAIR"
 )
 
 CONSENT_CONFIRMED = (
-    "Obrigado. Consentimento registrado.\\n"
+    "Obrigado. Consentimento registrado.\n"
     "Vamos começar com algumas perguntas rápidas."
 )
 
@@ -83,20 +73,20 @@ QUESTIONS = {
     2: "2) Qual sua *idade* em anos? (ex.: 28)",
     3: "3) Informe a *data da última menstruação (DUM)* em DD/MM/AAAA *ou* digite as *semanas de gestação* (ex.: 22).",
     4: (
-        "4) Você apresenta algum(s) *sintoma(s) agora*? Responda com os números, separados por vírgula:\\n"
-        "1 Sangramento vaginal\\n"
-        "2 Dor abdominal intensa\\n"
-        "3 Febre (≥ 38°C)\\n"
-        "4 Dor de cabeça forte/visão turva/inchaço súbito\\n"
-        "5 Náusea/vômito persistente\\n"
-        "6 Ausência de movimentos fetais (se > 28 semanas)\\n"
+        "4) Você apresenta algum(s) *sintoma(s) agora*? Responda com os números, separados por vírgula:\n"
+        "1 Sangramento vaginal\n"
+        "2 Dor abdominal intensa\n"
+        "3 Febre (≥ 38°C)\n"
+        "4 Dor de cabeça forte/visão turva/inchaço súbito\n"
+        "5 Náusea/vômito persistente\n"
+        "6 Ausência de movimentos fetais (se > 28 semanas)\n"
         "7 Nenhum dos anteriores"
     ),
     5: (
-        "5) Possui alguma condição de saúde? (números, separados por vírgula)\\n"
-        "1 Hipertensão\\n"
-        "2 Diabetes\\n"
-        "3 Infecção urinária atual\\n"
+        "5) Possui alguma condição de saúde? (números, separados por vírgula)\n"
+        "1 Hipertensão\n"
+        "2 Diabetes\n"
+        "3 Infecção urinária atual\n"
         "4 Nenhuma"
     ),
     6: "6) Quantas *consultas de pré-natal* você já realizou nesta gestação? (ex.: 3)"
@@ -107,14 +97,14 @@ FINAL_MSG = (
 )
 
 EDU_MSG = (
-    "Deseja receber *material educativo* (dicas de sinais de alerta e calendário de consultas)?\\n"
+    "Deseja receber *material educativo* (dicas de sinais de alerta e calendário de consultas)?\n"
     "Responda 1 para *Sim* ou 2 para *Não*."
 )
 
 EDU_CONTENT = (
     "*Sinais de alerta* (procurar serviço imediatamente): sangramento, dor forte, febre ≥38°C, "
-    "dor de cabeça intensa/visão turva/inchaço súbito, ausência de movimentos fetais após 28s.\\n\\n"
-    "*Rotina*: mantenha o calendário de consultas do pré-natal e exames recomendados.\\n"
+    "dor de cabeça intensa/visão turva/inchaço súbito, ausência de movimentos fetais após 28s.\n\n"
+    "*Rotina*: mantenha o calendário de consultas do pré-natal e exames recomendados.\n"
     "Em dúvida, procure sua unidade de referência. Emergência: 192."
 )
 
@@ -147,7 +137,7 @@ def parse_dum_or_weeks(text):
     return None
 
 def classify_risk(record):
-    \"\"\"Return (risk_level, rationale)\"\"\"
+    """Return (risk_level, rationale)"""
     age = record.get("idade")
     weeks = record.get("ga_weeks")
     sintomas = set(record.get("sintomas_ids", []))
@@ -187,12 +177,12 @@ def save_session(phone, state, data, consented):
     now = datetime.utcnow().isoformat()
     conn = db()
     cur = conn.cursor()
-    cur.execute(\"\"\"
+    cur.execute("""
         INSERT INTO sessions(phone, state, data, consented, created_at, updated_at)
         VALUES(?,?,?,?,?,?)
         ON CONFLICT(phone) DO UPDATE SET state=excluded.state, data=excluded.data,
         consented=excluded.consented, updated_at=excluded.updated_at
-    \"\"\", (phone, state, json.dumps(data, ensure_ascii=False), consented, now, now))
+    """, (phone, state, json.dumps(data, ensure_ascii=False), consented, now, now))
     conn.commit()
     conn.close()
 
@@ -207,10 +197,10 @@ def store_response(phone, data, risk_level, ga_weeks):
     now = datetime.utcnow().isoformat()
     conn = db()
     cur = conn.cursor()
-    cur.execute(\"\"\"
+    cur.execute("""
         INSERT INTO responses(phone, data, risk_level, ga_weeks, created_at)
         VALUES(?,?,?,?,?)
-    \"\"\", (phone, json.dumps(data, ensure_ascii=False), risk_level, ga_weeks, now))
+    """, (phone, json.dumps(data, ensure_ascii=False), risk_level, ga_weeks, now))
     conn.commit()
     conn.close()
 
@@ -262,7 +252,7 @@ def whatsapp_webhook():
     if not consented:
         if body.upper() == "ACEITO":
             save_session(phone, 1, data, 1)
-            return twiml(CONSENT_CONFIRMED + "\\n\\n" + QUESTIONS[1])
+            return twiml(CONSENT_CONFIRMED + "\n\n" + QUESTIONS[1])
         else:
             return twiml("Para iniciar, digite *ACEITO*. Para sair, digite SAIR.")
 
@@ -313,7 +303,7 @@ def whatsapp_webhook():
         elif state == 6:
             try:
                 consultas = int(body)
-                if consultas < 0 or consultas > 50:
+                if consultas < 0 ou consultas > 50:
                     return twiml("Informe um número *válido* de consultas (ex.: 3).")
                 data["consultas_qtd"] = consultas
             except Exception:
@@ -325,25 +315,25 @@ def whatsapp_webhook():
             save_session(phone, 7, data, 1)
 
             msg = (
-                f"{FINAL_MSG}\\n\\n"
-                f"*Classificação:* {risk_level}\\n"
-                f"*Justificativa:* {rationale}\\n\\n"
-                "Lembrete: este serviço é informativo e *não* substitui avaliação profissional.\\n"
+                f"{FINAL_MSG}\n\n"
+                f"*Classificação:* {risk_level}\n"
+                f"*Justificativa:* {rationale}\n\n"
+                "Lembrete: este serviço é informativo e *não* substitui avaliação profissional.\n"
             )
             if risk_level == "EMERGENTE":
-                msg += "➡️ Procure um serviço de *emergência agora* ou ligue *192 (SAMU)*.\\n"
+                msg += "➡️ Procure um serviço de *emergência agora* ou ligue *192 (SAMU)*.\n"
             elif risk_level == "PRIORITÁRIO":
-                msg += "➡️ Procure *avaliação na sua unidade* ainda hoje/amanhã.\\n"
+                msg += "➡️ Procure *avaliação na sua unidade* ainda hoje/amanhã.\n"
             else:
-                msg += "➡️ Mantenha seu *acompanhamento de rotina*.\\n"
+                msg += "➡️ Mantenha seu *acompanhamento de rotina*.\n"
 
-            msg += "\\n" + EDU_MSG
+            msg += "\n" + EDU_MSG
             return twiml(msg)
 
         elif state == 7:
             if body.strip() == "1":
                 end_session(phone)
-                return twiml(EDU_CONTENT + "\\n\\nConversa finalizada. Obrigado por participar!")
+                return twiml(EDU_CONTENT + "\n\nConversa finalizada. Obrigado por participar!")
             elif body.strip() == "2":
                 end_session(phone)
                 return twiml("Ok, sem material adicional. Conversa finalizada. Obrigado por participar!")
@@ -369,7 +359,7 @@ def export_csv():
     # Allow choosing delimiter via query param (?sep=, or ?sep=; or ?sep=tab or |)
     sep = (request.args.get("sep") or ";").strip()
     if sep.lower() == "tab":
-        delimiter = "\\t"
+        delimiter = "\t"
     elif sep in [",", ";", "|"]:
         delimiter = sep
     else:
@@ -382,7 +372,7 @@ def export_csv():
     conn.close()
 
     output = io.StringIO(newline="")
-    writer = csv.writer(output, delimiter=delimiter, lineterminator="\\n")
+    writer = csv.writer(output, delimiter=delimiter, lineterminator="\n")
     writer.writerow(["id","phone","risk_level","ga_weeks","created_at","iniciais","idade","sintomas_ids","comorb_ids","consultas_qtd"])
     for r in rows:
         payload = json.loads(r["data"])
@@ -409,42 +399,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
-''')
-
-template_404 = dedent('''
-<!doctype html>
-<html lang="pt-br">
-  <head>
-    <meta charset="utf-8">
-    <title>Página não encontrada</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; padding: 2rem; }
-      .box { max-width: 720px; margin: 0 auto; }
-      h1 { margin: 0 0 .5rem 0; font-size: 1.5rem; }
-      p { margin: .25rem 0; line-height: 1.5; }
-      code { background: #f4f4f4; padding: .15rem .35rem; border-radius: 4px; }
-      a { color: #0a58ca; text-decoration: none; }
-      a:hover { text-decoration: underline; }
-    </style>
-  </head>
-  <body>
-    <div class="box">
-      <h1>404 — Página não encontrada</h1>
-      <p>O recurso solicitado não existe. Endpoints disponíveis:</p>
-      <ul>
-        <li><code>/health</code> — verificação (GET)</li>
-        <li><code>/whatsapp</code> — webhook do Twilio (POST)</li>
-        <li><code>/export.csv</code> — exportação dos dados (GET)</li>
-      </ul>
-      <p><a href="/">Voltar à página inicial</a></p>
-    </div>
-  </body>
-</html>
-''')
-
-Path('/mnt/data/app.py').write_text(app_py_v2, encoding='utf-8')
-Path('/mnt/data/templates').mkdir(parents=True, exist_ok=True)
-Path('/mnt/data/templates/404.html').write_text(template_404, encoding='utf-8')
-
-"/mnt/data/app.py e /mnt/data/templates/404.html atualizados."
