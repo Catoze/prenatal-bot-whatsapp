@@ -1,3 +1,5 @@
+# app.py  (consolidado com RAG local via SQLite FTS5 + BM25)
+
 import os
 import re
 import json
@@ -8,6 +10,9 @@ from flask import Flask, request, Response, render_template
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
+# [NOVO - RAG]
+from werkzeug.utils import secure_filename
+
 # ---------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------
@@ -15,6 +20,7 @@ load_dotenv()
 app = Flask(__name__, template_folder="templates")
 
 DB_PATH = os.getenv("DB_PATH", "prenatal.db")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")  # defina no Render
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -24,6 +30,7 @@ def db():
 def init_db():
     conn = db()
     cur = conn.cursor()
+    # --- tabelas existentes ---
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             phone TEXT PRIMARY KEY,
@@ -44,63 +51,107 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
+
+    # --- [NOVO] base de conhecimento (mini-RAG local) ---
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS kb_docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            source TEXT,
+            added_at TEXT NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS kb_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL,
+            chunk_ix INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            FOREIGN KEY(doc_id) REFERENCES kb_docs(id)
+        )
+    """)
+
+    # índice FTS5 para BM25; pode não existir em alguns builds de SQLite
+    global RAG_AVAILABLE
+    RAG_AVAILABLE = True
+    try:
+        cur.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts
+            USING fts5(content, content='kb_chunks', content_rowid='id');
+        """)
+        cur.executescript("""
+            CREATE TRIGGER IF NOT EXISTS kb_chunks_ai AFTER INSERT ON kb_chunks
+            BEGIN
+                INSERT INTO kb_chunks_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS kb_chunks_ad AFTER DELETE ON kb_chunks
+            BEGIN
+                INSERT INTO kb_chunks_fts(kb_chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS kb_chunks_au AFTER UPDATE ON kb_chunks
+            BEGIN
+                INSERT INTO kb_chunks_fts(kb_chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO kb_chunks_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+        """)
+    except Exception:
+        # Fallback: sem RAG se FTS5 indisponível
+        RAG_AVAILABLE = False
+
     conn.commit()
     conn.close()
 
 init_db()
 
 # ---------------------------------------------------------------------
-# Educational/FAQ (resumos dos tópicos enviados pelo usuário)
-# Dica: você pode ajustar os textos abaixo conforme sua preferência.
+# Educational/FAQ (resumos disparados por ?palavra)
 # ---------------------------------------------------------------------
 def _t(s):  # minify multiline text
     return re.sub(r"[ \t]+\n", "\n", s.strip())
 
 FAQ_TOPICS = {
-    # chaves: conjunto de palavras-chave que disparam o tópico
     ("primeira consulta", "primeira vez", "começar", "iniciar"): _t("""
-        *Primeira consulta de pré-natal* — anamnese completa, PA, peso/altura (IMC),
-        exame físico, e solicitação dos exames iniciais (hemograma, tipagem e Rh,
-        glicemia, sorologias, urina/urocultura). Orientações: ácido fólico, nutrição,
-        calendário de consultas, sinais de alerta e vacinas.
+        *Primeira consulta de pré-natal* — anamnese, PA, peso/altura (IMC),
+        exame físico, exames iniciais (hemograma, tipagem/Rh, glicemia, sorologias,
+        urina/urocultura). Ácido fólico, nutrição, calendário e vacinas.
     """),
     ("consultas", "calendário", "frequência", "quantas consultas"): _t("""
-        *Calendário* — até 34s: mensais; 34–36s: quinzenais; após 36s: semanais.
-        Mínimo de 6 consultas. Em cada visita: PA, peso, altura uterina, BCF,
-        avaliação de edemas/queixas; exames por trimestre conforme protocolo.
+        *Calendário* — até 34s: mensais; 34–36s: quinzenais; >36s: semanais.
+        Mínimo 6 consultas. Em cada visita: PA, peso, AU, BCF, edemas/queixas;
+        exames por trimestre conforme protocolo.
     """),
     ("alimentação", "dieta", "nutrição", "comida", "peso"): _t("""
         *Alimentação* — dieta variada, 5–6 refeições/dia, hidratação adequada.
-        Evitar carnes/ovos crus, álcool e excesso de cafeína. Ganho ponderal depende do IMC.
+        Evitar carnes/ovos crus, álcool e excesso de cafeína. Ganho ponderal = IMC prévio.
     """),
     ("sintomas", "enjoo", "azia", "constipação", "dor nas costas", "inchaço"): _t("""
         *Sintomas comuns* — náuseas, azia, constipação, dor lombar, cãibras, edema.
-        Medidas não farmacológicas: fracionar refeições, hidratar, alongamentos, elevação de pernas.
+        Medidas: fracionar refeições, hidratação, alongamentos, elevar pernas.
         Procure serviço se dor intensa, sangramento, febre, cefaleia forte.
     """),
     ("sinais de alerta", "emergência", "perigo"): _t("""
         *Sinais de alerta* — sangramento, dor abdominal forte, PA muito alta,
-        febre, perda de líquido, diminuição de movimentos fetais, cefaleia intensa
-        com visão turva. Procure atendimento imediato / SAMU 192.
+        febre, perda de líquido, ↓ movimentos fetais, cefaleia intensa com visão turva.
+        Procure atendimento imediato / SAMU 192.
     """),
     ("vacina", "vacinação", "imunização"): _t("""
-        *Vacinas* — dTpa (20–36s), Influenza (anual), Hepatite B e COVID-19 conforme indicação.
-        Contraindicadas: tríplice viral, varicela (salvo situações especiais). Sempre informe que está grávida.
+        *Vacinas* — dTpa (20–36s), Influenza, Hepatite B e COVID-19 conforme indicação.
+        Contraindicadas: tríplice viral, varicela. Informe sempre que está grávida.
     """),
     ("exames", "ultrassom", "laboratório", "sangue", "urina"): _t("""
         *Exames* — 1º tri: hemograma, tipagem/Rh, glicemia, sorologias, urina/urocultura, US obstétrico.
-        2º tri: TOTG 24–28s, US morfológico; 3º tri: hemograma, sorologias de controle, cultura para EGB 35–37s.
+        2º tri: TOTG 24–28s, US morfológico; 3º tri: hemograma, sorologias de controle, cultura EGB 35–37s.
     """),
     ("diabetes", "glicose", "totg", "açúcar"): _t("""
-        *Diabetes gestacional* — rastreio com TOTG 75g (24–28s). Tratamento: dieta,
-        exercícios, monitorização e insulina se necessário. Risco ↑ para mãe/bebê se não controlada.
+        *Diabetes gestacional* — rastreio TOTG 75g (24–28s); tratamento: dieta/exercício,
+        monitorização e insulina se necessário.
     """),
     ("pressão alta", "hipertensão", "pré-eclâmpsia", "eclâmpsia"): _t("""
         *Síndromes hipertensivas* — PA ≥140/90 após 20s requer avaliação; sinais graves:
         cefaleia intensa, escotomas, dor epigástrica, edema súbito. Procure atendimento.
     """),
     ("parto prematuro", "contrações", "antes da hora"): _t("""
-        *Trabalho de parto prematuro* — contrações regulares antes de 37s, dor lombar,
+        *Trabalho de parto prematuro* — contrações regulares <37s, dor lombar,
         pressão pélvica, sangramento/perda de líquido. Procure serviço.
     """),
 }
@@ -321,13 +372,77 @@ def twiml(message):
     return Response(str(r), mimetype="application/xml")
 
 # ---------------------------------------------------------------------
+# [NOVO] Mini-RAG: chunking, ingestão e busca BM25
+# ---------------------------------------------------------------------
+def _chunk_text(txt: str, size=700, overlap=120):
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    chunks = []
+    i = 0
+    while i < len(txt):
+        j = min(len(txt), i + size)
+        cut = j
+        m = re.search(r'[.!?]\s', txt[i:j][::-1])
+        if m and m.start() > 40:
+            cut = i + (j - m.start())
+        chunks.append(txt[i:cut].strip())
+        i = max(cut - overlap, i + size)
+    return [c for c in chunks if c]
+
+def kb_add_text(title: str, text: str, source: str = None):
+    if not RAG_AVAILABLE:
+        return (-1, 0)
+    now = datetime.utcnow().isoformat()
+    conn = db(); cur = conn.cursor()
+    cur.execute("INSERT INTO kb_docs(title, source, added_at) VALUES (?,?,?)", (title, source, now))
+    doc_id = cur.lastrowid
+    for ix, c in enumerate(_chunk_text(text)):
+        cur.execute("INSERT INTO kb_chunks(doc_id, chunk_ix, content) VALUES (?,?,?)", (doc_id, ix, c))
+    conn.commit(); conn.close()
+    return (doc_id, ix + 1 if 'ix' in locals() else 0)
+
+def kb_search(query: str, k: int = 5):
+    if not RAG_AVAILABLE:
+        return []
+    conn = db(); cur = conn.cursor()
+    cur.execute("""
+        SELECT c.id, c.doc_id, c.chunk_ix,
+               snippet(kb_chunks_fts, 0, '[', ']', ' … ', 12) AS snippet,
+               d.title, d.source
+        FROM kb_chunks_fts
+        JOIN kb_chunks c ON c.id = kb_chunks_fts.rowid
+        JOIN kb_docs d    ON d.id = c.doc_id
+        WHERE kb_chunks_fts MATCH ?
+        ORDER BY rank LIMIT ?
+    """, (query, k))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def rag_answer(query: str):
+    hits = kb_search(query, k=5)
+    if not hits:
+        return ("Não encontrei conteúdo na biblioteca para essa dúvida. "
+                "Digite *MENU* para ver tópicos ou reformule com `? sua dúvida`.")
+    bullets = []
+    refs = []
+    for r in hits[:3]:
+        bullets.append(f"• {r['snippet']}")
+        refs.append(r['source'] or r['title'] or f"doc {r['doc_id']}")
+    ans = ("📚 *Resumo com base na nossa biblioteca*\n"
+           + "\n".join(bullets) +
+           "\n\nFontes: " + "; ".join(sorted(set(refs))[:3]) +
+           "\n\n*Aviso*: informações educativas; não substituem avaliação profissional.")
+    return ans
+
+# ---------------------------------------------------------------------
 # Home & Errors
 # ---------------------------------------------------------------------
 @app.get("/")
 def index():
     return (
         "Chatbot Pré-Natal online. Endpoints: "
-        "/health (GET), /whatsapp (POST, Twilio webhook), /export.csv (GET)."
+        "/health (GET), /whatsapp (POST, Twilio webhook), /export.csv (GET), "
+        "/kb/ingest (POST, admin)."
     )
 
 @app.errorhandler(404)
@@ -366,14 +481,23 @@ def whatsapp_webhook():
     data = json.loads(sess["data"] or "{}")
     consented = sess["consented"] == 1
 
-    # Atalhos de FAQ (não mudam o estado)
-    if up.startswith("?") or any(k in body.lower() for k in ["alimentação","vacina","sinais de alerta","consultas","exames","diabetes","pressão","prematuro","primeira consulta","sintomas"]):
+    # [NOVO] Consultas educativas: FAQ → RAG (não altera estado)
+    # Gatilho: começa com "?" ou contém palavras educativas
+    if up.startswith("?") or any(k in body.lower() for k in [
+        "ajuda","material","informação","informacoes","informações","sinais","consultas","vacina","exames","diabetes",
+        "pressão","prematuro","primeira consulta","sintomas"
+    ]):
+        if not consented:
+            return twiml("Para acessar materiais educativos e iniciar o atendimento, responda *ACEITO*.")
+        # 1) tenta FAQ
         ans = answer_faq(body)
         if ans:
             return twiml(ans + "\n\nDigite *CONTINUAR* para voltar ao questionário, ou *MENU* para ver mais tópicos.")
-        if up.startswith("?"):
-            return twiml("Não encontrei esse tópico. Digite *MENU* para ver as opções ou *CONTINUAR* para seguir o questionário.")
-        # se caiu aqui, segue o fluxo normal
+        # 2) fallback: RAG
+        q = body[1:].strip() if body.strip().startswith("?") else body.strip()
+        if q:
+            return twiml(rag_answer(q) + "\n\nDigite *CONTINUAR* para retomar o questionário.")
+        # sem consulta válida → segue fluxo
 
     if not consented:
         if up == "ACEITO":
@@ -382,9 +506,8 @@ def whatsapp_webhook():
         else:
             return twiml("Para iniciar, digite *ACEITO*. Para sair, digite SAIR.")
 
-    # Estado especial para continuar após FAQ
+    # Estado especial para continuar após FAQ/RAG
     if up == "CONTINUAR":
-        # não altera o estado; apenas repete a pergunta corrente
         return twiml(QUESTIONS.get(state, "Vamos continuar."))
 
     # state machine
@@ -508,7 +631,7 @@ def whatsapp_webhook():
             end_session(phone)
             return twiml("Sessão reiniciada. Digite *ACEITO* para iniciar.")
 
-    except Exception as e:
+    except Exception:
         end_session(phone)
         return twiml("Ocorreu um erro inesperado. Tente novamente mais tarde.")
 
@@ -563,9 +686,34 @@ def export_csv():
     return Response(csv_bytes, mimetype="text/csv",
                     headers={"Content-Disposition":"attachment; filename=prenatal_export.csv"})
 
+# [NOVO] Ingestão de conhecimento (RAG)
+@app.post("/kb/ingest")
+def kb_ingest():
+    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
+        return {"error": "unauthorized"}, 401
+    if not RAG_AVAILABLE:
+        return {"error": "fts5_unavailable"}, 503
+
+    title = (request.form.get("title") or "").strip() or "Sem título"
+    source = (request.form.get("source") or "").strip() or None
+    text = (request.form.get("text") or "").strip()
+
+    if not text and "file" in request.files:
+        f = request.files["file"]
+        name = secure_filename(f.filename or "upload.txt")
+        text = f.read().decode("utf-8", errors="ignore")
+        if not source:
+            source = name
+
+    if not text:
+        return {"error": "forneça 'text' ou 'file'"}, 400
+
+    doc_id, n = kb_add_text(title, text, source)
+    return {"ok": True, "doc_id": doc_id, "chunks": n}
+
 @app.get("/health")
 def health():
-    return {"ok": True, "time": datetime.utcnow().isoformat()}
+    return {"ok": True, "rag": RAG_AVAILABLE, "time": datetime.utcnow().isoformat()}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
