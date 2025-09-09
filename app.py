@@ -1,5 +1,3 @@
-# app.py  (consolidado com RAG local via SQLite FTS5 + BM25)
-
 import os
 import re
 import json
@@ -10,9 +8,6 @@ from flask import Flask, request, Response, render_template
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
-# [NOVO - RAG]
-from werkzeug.utils import secure_filename
-
 # ---------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------
@@ -20,7 +15,6 @@ load_dotenv()
 app = Flask(__name__, template_folder="templates")
 
 DB_PATH = os.getenv("DB_PATH", "prenatal.db")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "changeme")  # defina no Render
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -30,7 +24,6 @@ def db():
 def init_db():
     conn = db()
     cur = conn.cursor()
-    # --- tabelas existentes ---
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             phone TEXT PRIMARY KEY,
@@ -51,123 +44,81 @@ def init_db():
             created_at TEXT NOT NULL
         )
     """)
-
-    # --- [NOVO] base de conhecimento (mini-RAG local) ---
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS kb_docs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            source TEXT,
-            added_at TEXT NOT NULL
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS kb_chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            doc_id INTEGER NOT NULL,
-            chunk_ix INTEGER NOT NULL,
-            content TEXT NOT NULL,
-            FOREIGN KEY(doc_id) REFERENCES kb_docs(id)
-        )
-    """)
-
-    # índice FTS5 para BM25; pode não existir em alguns builds de SQLite
-    global RAG_AVAILABLE
-    RAG_AVAILABLE = True
-    try:
-        cur.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS kb_chunks_fts
-            USING fts5(content, content='kb_chunks', content_rowid='id');
-        """)
-        cur.executescript("""
-            CREATE TRIGGER IF NOT EXISTS kb_chunks_ai AFTER INSERT ON kb_chunks
-            BEGIN
-                INSERT INTO kb_chunks_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS kb_chunks_ad AFTER DELETE ON kb_chunks
-            BEGIN
-                INSERT INTO kb_chunks_fts(kb_chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS kb_chunks_au AFTER UPDATE ON kb_chunks
-            BEGIN
-                INSERT INTO kb_chunks_fts(kb_chunks_fts, rowid, content) VALUES('delete', old.id, old.content);
-                INSERT INTO kb_chunks_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-        """)
-    except Exception:
-        # Fallback: sem RAG se FTS5 indisponível
-        RAG_AVAILABLE = False
-
     conn.commit()
     conn.close()
 
 init_db()
 
 # ---------------------------------------------------------------------
-# Educational/FAQ (resumos disparados por ?palavra)
+# Educational/FAQ (resumos dos tópicos; usuário envia "? termo")
 # ---------------------------------------------------------------------
 def _t(s):  # minify multiline text
     return re.sub(r"[ \t]+\n", "\n", s.strip())
 
 FAQ_TOPICS = {
     ("primeira consulta", "primeira vez", "começar", "iniciar"): _t("""
-        *Primeira consulta de pré-natal* — anamnese, PA, peso/altura (IMC),
-        exame físico, exames iniciais (hemograma, tipagem/Rh, glicemia, sorologias,
-        urina/urocultura). Ácido fólico, nutrição, calendário e vacinas.
+        *Primeira consulta de pré-natal*
+        • Anamnese, PA, peso/altura (IMC), exame físico
+        • Exames iniciais: hemograma, tipagem/Rh, glicemia, sorologias, urina/urocultura
+        • Orientações: ácido fólico, vacinas, calendário e sinais de alerta
     """),
     ("consultas", "calendário", "frequência", "quantas consultas"): _t("""
-        *Calendário* — até 34s: mensais; 34–36s: quinzenais; >36s: semanais.
-        Mínimo 6 consultas. Em cada visita: PA, peso, AU, BCF, edemas/queixas;
-        exames por trimestre conforme protocolo.
+        *Calendário de consultas*
+        • Até 34s: mensais | 34–36s: quinzenais | >36s: semanais
+        • Mínimo recomendado: 6 consultas
     """),
     ("alimentação", "dieta", "nutrição", "comida", "peso"): _t("""
-        *Alimentação* — dieta variada, 5–6 refeições/dia, hidratação adequada.
-        Evitar carnes/ovos crus, álcool e excesso de cafeína. Ganho ponderal = IMC prévio.
+        *Alimentação na gestação*
+        • Refeições fracionadas, hidratação adequada
+        • Evitar carnes/ovos crus, álcool e excesso de cafeína
     """),
     ("sintomas", "enjoo", "azia", "constipação", "dor nas costas", "inchaço"): _t("""
-        *Sintomas comuns* — náuseas, azia, constipação, dor lombar, cãibras, edema.
-        Medidas: fracionar refeições, hidratação, alongamentos, elevar pernas.
-        Procure serviço se dor intensa, sangramento, febre, cefaleia forte.
+        *Sintomas comuns e alívio*
+        • Náuseas/azia/constipação/dor lombar/edema: medidas não farmacológicas
+        • Procure serviço se dor intensa, sangramento, febre, cefaleia forte
     """),
     ("sinais de alerta", "emergência", "perigo"): _t("""
-        *Sinais de alerta* — sangramento, dor abdominal forte, PA muito alta,
-        febre, perda de líquido, ↓ movimentos fetais, cefaleia intensa com visão turva.
-        Procure atendimento imediato / SAMU 192.
+        *Sinais de alerta (procure serviço imediatamente / 192 SAMU)*
+        • Sangramento, dor abdominal forte, febre, perda de líquido
+        • Diminuição dos movimentos fetais, cefaleia intensa com visão turva
     """),
     ("vacina", "vacinação", "imunização"): _t("""
-        *Vacinas* — dTpa (20–36s), Influenza, Hepatite B e COVID-19 conforme indicação.
-        Contraindicadas: tríplice viral, varicela. Informe sempre que está grávida.
+        *Vacinas*
+        • dTpa (20–36s), Influenza (anual), Hepatite B e COVID-19 conforme indicação
+        • Contraindicadas: tríplice viral, varicela
     """),
     ("exames", "ultrassom", "laboratório", "sangue", "urina"): _t("""
-        *Exames* — 1º tri: hemograma, tipagem/Rh, glicemia, sorologias, urina/urocultura, US obstétrico.
-        2º tri: TOTG 24–28s, US morfológico; 3º tri: hemograma, sorologias de controle, cultura EGB 35–37s.
+        *Exames por trimestre (resumo)*
+        • 1º: hemograma, tipagem/Rh, glicemia, sorologias, urina/urocultura, US obstétrico
+        • 2º: TOTG 24–28s, US morfológico
+        • 3º: hemograma, sorologias de controle, cultura EGB 35–37s
     """),
     ("diabetes", "glicose", "totg", "açúcar"): _t("""
-        *Diabetes gestacional* — rastreio TOTG 75g (24–28s); tratamento: dieta/exercício,
-        monitorização e insulina se necessário.
+        *Diabetes gestacional*
+        • Rastreamento com TOTG 75g (24–28s); dieta, exercícios e, se preciso, insulina
     """),
     ("pressão alta", "hipertensão", "pré-eclâmpsia", "eclâmpsia"): _t("""
-        *Síndromes hipertensivas* — PA ≥140/90 após 20s requer avaliação; sinais graves:
-        cefaleia intensa, escotomas, dor epigástrica, edema súbito. Procure atendimento.
+        *Pressão na gravidez*
+        • PA ≥140/90 após 20s pede avaliação
+        • Sinais graves: cefaleia forte, escotomas, dor epigástrica, edema súbito
     """),
     ("parto prematuro", "contrações", "antes da hora"): _t("""
-        *Trabalho de parto prematuro* — contrações regulares <37s, dor lombar,
-        pressão pélvica, sangramento/perda de líquido. Procure serviço.
+        *Trabalho de parto prematuro*
+        • Contrações regulares <37s, dor lombar, pressão pélvica, sangramento/perda de líquido
+    """),
+    ("faixa etária", "idade materna", "adolescente", "gravidez após 35"): _t("""
+        *Faixa etária e riscos*
+        • <18 anos ou ≥35 anos podem ter maior chance de alguns eventos obstétricos
+        • Não é diagnóstico; significa acompanhamento mais próximo e atento
     """),
 }
 
 FAQ_MENU = _t("""
 *Ajuda/Informações* — envie:
-• `? primeira consulta`
-• `? consultas`
-• `? alimentação`
-• `? sintomas`
-• `? sinais de alerta`
-• `? vacinação`
-• `? exames`
-• `? diabetes`
-• `? pressão alta`
-• `? parto prematuro`
+• `? primeira consulta` • `? consultas` • `? alimentação`
+• `? sintomas` • `? sinais de alerta` • `? vacinação`
+• `? exames` • `? diabetes` • `? pressão alta`
+• `? parto prematuro` • `? faixa etária`
 (Use `MENU` para ver esta lista; `CONTINUAR` volta ao questionário.)
 """)
 
@@ -186,36 +137,47 @@ def answer_faq(text: str) -> str | None:
 SEVERE_SYMPTOM_IDS = {"1","2","3","4","6"}  # flags for urgent care
 
 WELCOME = (
-    "Olá! Sou o assistente *Pré-Natal* da pesquisa.\n\n"
-    "*Aviso*: este serviço NÃO substitui atendimento médico. "
-    "Em emergência, ligue 192 (SAMU).\n\n"
+    "Olá! Sou o assistente *Pré-Natal*.\n\n"
+    "*Aviso*: este serviço NÃO substitui atendimento médico. Em emergência, ligue 192 (SAMU).\n\n"
     "Se você *concorda em participar* e autoriza o uso dos dados para fins acadêmicos "
     "conforme a LGPD, responda: *ACEITO*.\n\n"
-    "Comandos: *MENU*, *REINICIAR*, *SAIR*."
+    "Comandos: *MENU*, *CONTINUAR*, *REINICIAR*, *SAIR*."
 )
 
-CONSENT_CONFIRMED = (
-    "Obrigado. Consentimento registrado. Vamos começar com algumas perguntas rápidas."
-)
+CONSENT_CONFIRMED = "Obrigado. Consentimento registrado. Vamos começar com algumas perguntas rápidas."
 
 QUESTIONS = {
     1: "1) Para preservar a privacidade, informe apenas *iniciais* do seu nome (ex.: A.R.M.).",
     2: "2) Qual sua *idade* em anos? (ex.: 28)",
-    3: "3) Informe a *data da última menstruação (DUM)* em DD/MM/AAAA *ou* digite as *semanas de gestação* (ex.: 22).",
+    3: (
+        "3) Informe a *data da última menstruação (DUM)* em *DD/MM/AAAA*\n"
+        "   *ou* digite apenas as *semanas de gestação* (ex.: 22)."
+    ),
     4: (
-        "4) Você apresenta algum(s) *sintoma(s) agora*? Responda com os números, separados por vírgula:\n"
-        "1 Sangramento vaginal | 2 Dor abdominal intensa | 3 Febre (≥ 38°C)\n"
-        "4 Dor de cabeça forte/visão turva/inchaço súbito | 5 Náusea/vômito persistente\n"
-        "6 Ausência de movimentos fetais (> 28s) | 7 Nenhum dos anteriores"
+        "4) Você apresenta algum(s) *sintoma(s) agora*? Responda com os números (ex.: 1,3):\n"
+        "1 Sangramento vaginal\n"
+        "2 Dor abdominal intensa\n"
+        "3 Febre (≥ 38°C)\n"
+        "4 Dor de cabeça forte / visão turva / inchaço súbito\n"
+        "5 Náusea/vômito persistente\n"
+        "6 Ausência de movimentos fetais (> 28s)\n"
+        "7 Nenhum dos anteriores"
     ),
     5: (
-        "5) Possui alguma condição de saúde? (números, separados por vírgula)\n"
-        "1 Hipertensão | 2 Diabetes | 3 Infecção urinária atual | 4 Nenhuma"
+        "5) Possui alguma *condição de saúde*? (números, ex.: 1,4)\n"
+        "1 Hipertensão\n"
+        "2 Diabetes\n"
+        "3 Infecção urinária atual\n"
+        "4 Nenhuma"
     ),
     6: "6) Quantas *consultas de pré-natal* você já realizou nesta gestação? (ex.: 3)",
-    7: "7) Você consegue informar sua *pressão arterial* hoje? Envie como *120/80* (ou digite *PULAR*).",
-    8: "8) Informe seu *peso (kg)* e *altura (m)* no formato: *70 1.60* (ou *PULAR*).",
-    9: "9) Você usa *tabaco* ou *álcool* atualmente? Responda *1* Sim ou *2* Não.",
+    7: (
+        "7) Você consegue informar sua *pressão arterial* agora?\n"
+        "   Envie como *12x8*, *12/8*, *12 8* ou *120/80* (ou digite *PULAR*)."
+    ),
+    8: "8) Informe seu *peso em kg* (ex.: 70). Se não souber, digite *PULAR*.",
+    9: "9) Informe sua *altura em metros* (ex.: 1.60). Se não souber, digite *PULAR*.",
+    10: "10) Você usa *tabaco* ou *álcool* atualmente? Responda *1* Sim ou *2* Não.",
 }
 
 FINAL_MSG = "Obrigado. Avaliando suas respostas…"
@@ -226,7 +188,7 @@ EDU_MSG = (
 )
 
 EDU_CONTENT = (
-    "*Sinais de alerta* (procurar serviço imediatamente): sangramento, dor forte, febre ≥38°C, "
+    "*Sinais de alerta* (procure serviço imediatamente): sangramento, dor forte, febre ≥38°C, "
     "dor de cabeça intensa/visão turva/inchaço súbito, ausência de movimentos fetais após 28s.\n\n"
     "*Rotina*: mantenha o calendário de consultas do pré-natal e exames recomendados.\n"
     "Em dúvida, procure sua unidade de referência. Emergência: 192."
@@ -260,31 +222,57 @@ def parse_dum_or_weeks(text):
     return None
 
 def parse_bp(text):
-    """Return (systolic, diastolic) or (None, None). Accept '120/80' with spaces."""
-    m = re.search(r"(\d{2,3})\s*/\s*(\d{2,3})", text)
+    """
+    Aceita: "12x8", "12/8", "12 8", "120/80".
+    Se valores forem estilo '12' e '8', converte para 120/80.
+    Retorna (sistólica, diastólica) ou (None, None).
+    """
+    t = text.lower().replace(",", ".").strip()
+    # normaliza separadores
+    t = t.replace("x", "/").replace(" ", "/")
+    m = re.search(r"(\d{2,3})\s*/\s*(\d{1,3})", t)
     if not m:
         return None, None
     try:
         s = int(m.group(1))
         d = int(m.group(2))
+        # Se veio "12/8", multiplica por 10 -> 120/80
+        if s < 30 and d < 30:
+            s *= 10
+            d *= 10
         if 60 <= s <= 260 and 30 <= d <= 180:
             return s, d
     except Exception:
         pass
     return None, None
 
-def parse_weight_height(text):
-    """Parse '70 1.60' or '70, 1,60' → (70.0, 1.60)"""
-    t = text.replace(",", ".").strip()
-    nums = [x for x in re.findall(r"[0-9.]+", t)]
-    if len(nums) >= 2:
-        try:
-            w = float(nums[0]); h = float(nums[1])
-            if 30 <= w <= 250 and 1.3 <= h <= 2.2:
-                return w, h
-        except Exception:
-            pass
-    return None, None
+def parse_kg(text):
+    """retorna peso em kg (float) se válido; aceita '70', '70,5', '70kg'."""
+    t = text.lower().replace(",", ".")
+    m = re.search(r"(\d+(\.\d+)?)", t)
+    if not m:
+        return None
+    try:
+        w = float(m.group(1))
+        if 30 <= w <= 250:
+            return round(w, 1)
+    except Exception:
+        pass
+    return None
+
+def parse_meters(text):
+    """retorna altura em metros (float) se válido; aceita '1.60', '1,60', '1.60m'."""
+    t = text.lower().replace(",", ".")
+    m = re.search(r"(\d+(\.\d+)?)", t)
+    if not m:
+        return None
+    try:
+        h = float(m.group(1))
+        if 1.3 <= h <= 2.2:
+            return round(h, 2)
+    except Exception:
+        pass
+    return None
 
 def classify_risk(record):
     """Return (risk_level, rationale)"""
@@ -299,7 +287,7 @@ def classify_risk(record):
 
     # Emergente
     if sintomas & SEVERE_SYMPTOM_IDS:
-        return ("EMERGENTE", "Sintoma(s) de alerta reportado(s). Orientar ida IMEDIATA ao serviço de saúde / 192.")
+        return ("EMERGENTE", "Sintoma(s) de alerta reportado(s). Orientar ida IMEDIATA ao serviço / 192.")
     if sys and dia and (sys >= 160 or dia >= 110):
         return ("EMERGENTE", "Pressão arterial muito elevada (≥160/110). Procurar emergência.")
 
@@ -307,7 +295,7 @@ def classify_risk(record):
     priority_reasons = []
     try:
         if age is not None and (age < 18 or age >= 35):
-            priority_reasons.append("Faixa etária <18 ou ≥35.")
+            priority_reasons.append("Faixa etária (<18 ou ≥35) pode elevar riscos obstétricos; acompanhamento mais próximo é recomendado.")
     except Exception:
         pass
 
@@ -323,7 +311,7 @@ def classify_risk(record):
         priority_reasons.append("Uso de tabaco/álcool (risco gestacional).")
 
     if priority_reasons:
-        return ("PRIORITÁRIO", "; ".join(priority_reasons) + " Orientar avaliação em breve (hoje/amanhã).")
+        return ("PRIORITÁRIO", "; ".join(priority_reasons) + " Para saber mais, envie `? faixa etária` ou `? pressão alta`. Orientar avaliação em breve (hoje/amanhã).")
 
     return ("ROTINA", "Sem sinais de alerta no momento. Manter acompanhamento de pré-natal e orientações gerais.")
 
@@ -372,77 +360,13 @@ def twiml(message):
     return Response(str(r), mimetype="application/xml")
 
 # ---------------------------------------------------------------------
-# [NOVO] Mini-RAG: chunking, ingestão e busca BM25
-# ---------------------------------------------------------------------
-def _chunk_text(txt: str, size=700, overlap=120):
-    txt = re.sub(r'\s+', ' ', txt).strip()
-    chunks = []
-    i = 0
-    while i < len(txt):
-        j = min(len(txt), i + size)
-        cut = j
-        m = re.search(r'[.!?]\s', txt[i:j][::-1])
-        if m and m.start() > 40:
-            cut = i + (j - m.start())
-        chunks.append(txt[i:cut].strip())
-        i = max(cut - overlap, i + size)
-    return [c for c in chunks if c]
-
-def kb_add_text(title: str, text: str, source: str = None):
-    if not RAG_AVAILABLE:
-        return (-1, 0)
-    now = datetime.utcnow().isoformat()
-    conn = db(); cur = conn.cursor()
-    cur.execute("INSERT INTO kb_docs(title, source, added_at) VALUES (?,?,?)", (title, source, now))
-    doc_id = cur.lastrowid
-    for ix, c in enumerate(_chunk_text(text)):
-        cur.execute("INSERT INTO kb_chunks(doc_id, chunk_ix, content) VALUES (?,?,?)", (doc_id, ix, c))
-    conn.commit(); conn.close()
-    return (doc_id, ix + 1 if 'ix' in locals() else 0)
-
-def kb_search(query: str, k: int = 5):
-    if not RAG_AVAILABLE:
-        return []
-    conn = db(); cur = conn.cursor()
-    cur.execute("""
-        SELECT c.id, c.doc_id, c.chunk_ix,
-               snippet(kb_chunks_fts, 0, '[', ']', ' … ', 12) AS snippet,
-               d.title, d.source
-        FROM kb_chunks_fts
-        JOIN kb_chunks c ON c.id = kb_chunks_fts.rowid
-        JOIN kb_docs d    ON d.id = c.doc_id
-        WHERE kb_chunks_fts MATCH ?
-        ORDER BY rank LIMIT ?
-    """, (query, k))
-    rows = cur.fetchall()
-    conn.close()
-    return rows
-
-def rag_answer(query: str):
-    hits = kb_search(query, k=5)
-    if not hits:
-        return ("Não encontrei conteúdo na biblioteca para essa dúvida. "
-                "Digite *MENU* para ver tópicos ou reformule com `? sua dúvida`.")
-    bullets = []
-    refs = []
-    for r in hits[:3]:
-        bullets.append(f"• {r['snippet']}")
-        refs.append(r['source'] or r['title'] or f"doc {r['doc_id']}")
-    ans = ("📚 *Resumo com base na nossa biblioteca*\n"
-           + "\n".join(bullets) +
-           "\n\nFontes: " + "; ".join(sorted(set(refs))[:3]) +
-           "\n\n*Aviso*: informações educativas; não substituem avaliação profissional.")
-    return ans
-
-# ---------------------------------------------------------------------
 # Home & Errors
 # ---------------------------------------------------------------------
 @app.get("/")
 def index():
     return (
         "Chatbot Pré-Natal online. Endpoints: "
-        "/health (GET), /whatsapp (POST, Twilio webhook), /export.csv (GET), "
-        "/kb/ingest (POST, admin)."
+        "/health (GET), /whatsapp (POST, Twilio webhook), /export.csv (GET)."
     )
 
 @app.errorhandler(404)
@@ -481,23 +405,16 @@ def whatsapp_webhook():
     data = json.loads(sess["data"] or "{}")
     consented = sess["consented"] == 1
 
-    # [NOVO] Consultas educativas: FAQ → RAG (não altera estado)
-    # Gatilho: começa com "?" ou contém palavras educativas
+    # Atalhos de FAQ (não mudam o estado)
     if up.startswith("?") or any(k in body.lower() for k in [
-        "ajuda","material","informação","informacoes","informações","sinais","consultas","vacina","exames","diabetes",
-        "pressão","prematuro","primeira consulta","sintomas"
+        "alimentação","vacina","sinais de alerta","consultas","exames",
+        "diabetes","pressão","prematuro","primeira consulta","sintomas","faixa etária"
     ]):
-        if not consented:
-            return twiml("Para acessar materiais educativos e iniciar o atendimento, responda *ACEITO*.")
-        # 1) tenta FAQ
         ans = answer_faq(body)
         if ans:
             return twiml(ans + "\n\nDigite *CONTINUAR* para voltar ao questionário, ou *MENU* para ver mais tópicos.")
-        # 2) fallback: RAG
-        q = body[1:].strip() if body.strip().startswith("?") else body.strip()
-        if q:
-            return twiml(rag_answer(q) + "\n\nDigite *CONTINUAR* para retomar o questionário.")
-        # sem consulta válida → segue fluxo
+        if up.startswith("?"):
+            return twiml("Não encontrei esse tópico. Digite *MENU* para ver as opções ou *CONTINUAR* para seguir o questionário.")
 
     if not consented:
         if up == "ACEITO":
@@ -506,7 +423,7 @@ def whatsapp_webhook():
         else:
             return twiml("Para iniciar, digite *ACEITO*. Para sair, digite SAIR.")
 
-    # Estado especial para continuar após FAQ/RAG
+    # Estado especial: repetir a pergunta corrente
     if up == "CONTINUAR":
         return twiml(QUESTIONS.get(state, "Vamos continuar."))
 
@@ -566,34 +483,51 @@ def whatsapp_webhook():
             return twiml(QUESTIONS[7])
 
         elif state == 7:
-            if body.upper() == "PULAR":
+            if up == "PULAR":
                 data["pa_sys"] = None
                 data["pa_dia"] = None
             else:
                 s, d = parse_bp(body)
                 if not s or not d:
-                    return twiml("Formato inválido. Envie como *120/80* ou digite *PULAR*.")
+                    return twiml("Formato inválido. Envie como *12x8*, *12/8*, *12 8* ou *120/80* (ou digite *PULAR*).")
                 data["pa_sys"] = s
                 data["pa_dia"] = d
             save_session(phone, 8, data, 1)
             return twiml(QUESTIONS[8])
 
         elif state == 8:
-            if body.upper() == "PULAR":
+            if up == "PULAR":
                 data["peso"] = None
-                data["altura"] = None
-                data["imc"] = None
             else:
-                w, h = parse_weight_height(body)
-                if not w or not h:
-                    return twiml("Formato inválido. Envie como *70 1.60* (peso kg e altura m) ou digite *PULAR*.")
+                w = parse_kg(body)
+                if w is None:
+                    return twiml("Informe apenas o *peso em kg* (ex.: 70) ou digite *PULAR*.")
                 data["peso"] = w
-                data["altura"] = h
-                data["imc"] = round(w / (h*h), 1)
+            # recalcula IMC se já houver altura
+            if data.get("peso") and data.get("altura"):
+                data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
+            else:
+                data["imc"] = None
             save_session(phone, 9, data, 1)
             return twiml(QUESTIONS[9])
 
         elif state == 9:
+            if up == "PULAR":
+                data["altura"] = None
+            else:
+                h = parse_meters(body)
+                if h is None:
+                    return twiml("Informe apenas a *altura em metros* (ex.: 1.60) ou digite *PULAR*.")
+                data["altura"] = h
+            # recalcula IMC se já houver peso
+            if data.get("peso") and data.get("altura"):
+                data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
+            else:
+                data["imc"] = None
+            save_session(phone, 10, data, 1)
+            return twiml(QUESTIONS[10])
+
+        elif state == 10:
             if body.strip() not in ("1","2"):
                 return twiml("Responda *1* para Sim ou *2* para Não.")
             data["habitos"] = "sim" if body.strip() == "1" else "nao"
@@ -601,7 +535,7 @@ def whatsapp_webhook():
             # Classificar
             risk_level, rationale = classify_risk(data)
             store_response(phone, data, risk_level, data.get("ga_weeks"))
-            save_session(phone, 10, data, 1)
+            save_session(phone, 11, data, 1)
 
             msg = (
                 f"{FINAL_MSG}\n\n"
@@ -617,7 +551,7 @@ def whatsapp_webhook():
             msg += "\n" + EDU_MSG
             return twiml(msg)
 
-        elif state == 10:
+        elif state == 11:
             if body.strip() == "1":
                 end_session(phone)
                 return twiml(EDU_CONTENT + "\n\nConversa finalizada. Obrigado por participar!")
@@ -665,11 +599,7 @@ def export_csv():
     for r in rows:
         payload = json.loads(r["data"])
         writer.writerow([
-            r["id"],
-            r["phone"],
-            r["risk_level"],
-            r["ga_weeks"],
-            r["created_at"],
+            r["id"], r["phone"], r["risk_level"], r["ga_weeks"], r["created_at"],
             payload.get("iniciais",""),
             payload.get("idade",""),
             "|".join(payload.get("sintomas_ids", [])),
@@ -686,34 +616,9 @@ def export_csv():
     return Response(csv_bytes, mimetype="text/csv",
                     headers={"Content-Disposition":"attachment; filename=prenatal_export.csv"})
 
-# [NOVO] Ingestão de conhecimento (RAG)
-@app.post("/kb/ingest")
-def kb_ingest():
-    if request.headers.get("X-Admin-Token") != ADMIN_TOKEN:
-        return {"error": "unauthorized"}, 401
-    if not RAG_AVAILABLE:
-        return {"error": "fts5_unavailable"}, 503
-
-    title = (request.form.get("title") or "").strip() or "Sem título"
-    source = (request.form.get("source") or "").strip() or None
-    text = (request.form.get("text") or "").strip()
-
-    if not text and "file" in request.files:
-        f = request.files["file"]
-        name = secure_filename(f.filename or "upload.txt")
-        text = f.read().decode("utf-8", errors="ignore")
-        if not source:
-            source = name
-
-    if not text:
-        return {"error": "forneça 'text' ou 'file'"}, 400
-
-    doc_id, n = kb_add_text(title, text, source)
-    return {"ok": True, "doc_id": doc_id, "chunks": n}
-
 @app.get("/health")
 def health():
-    return {"ok": True, "rag": RAG_AVAILABLE, "time": datetime.utcnow().isoformat()}
+    return {"ok": True, "time": datetime.utcnow().isoformat()}
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
