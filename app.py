@@ -138,11 +138,7 @@ def answer_faq(text: str) -> str | None:
 SEVERE_SYMPTOM_IDS = {"1","2","3","4","6"}  # flags for urgent care
 
 WELCOME = (
-    "Olá! Sou o assistente *Pré-Natal*.\n\n"
-    "*Aviso*: este serviço NÃO substitui atendimento médico. Em emergência, ligue 192 (SAMU).\n\n"
-    "Se você *concorda em participar* e autoriza o uso dos dados para fins acadêmicos "
-    "conforme a LGPD, responda: *ACEITO*.\n\n"
-    "Comandos: *MENU*, *CONTINUAR*, *REINICIAR*, *SAIR*."
+   "Oi! Sou o assistente Pré-Natal. Digite ACEITO para começar."
 )
 
 CONSENT_CONFIRMED = "Obrigado. Consentimento registrado. Vamos começar com algumas perguntas rápidas."
