@@ -632,3 +632,14 @@ def health():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
+
+@app.route("/whatsapp-test", methods=["GET", "POST"])
+def whatsapp_test():
+    incoming = request.values
+    body = (incoming.get("Body") or "").strip()
+    from_raw = incoming.get("From") or ""
+    phone = from_raw.replace("whatsapp:", "")
+    print("TEST IN:", phone, body, flush=True)
+    return twiml("✅ Webhook OK. Envie *ACEITO* para começar.")
+}
+
