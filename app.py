@@ -326,14 +326,12 @@ ALERTA_BASE = (
 
 def parse_dum_or_weeks(text):
     text = text.strip()
-    # Tenta semanas inteiras
     try:
         w = int(text)
         if 0 <= w <= 45:
             return w
     except ValueError:
         pass
-    # Tenta data dd/mm/aaaa
     try:
         dt = datetime.strptime(text, "%d/%m/%Y").date()
         days = (date.today() - dt).days
@@ -395,12 +393,9 @@ def parse_meters(text):
     return None
 
 def trimester_from_weeks(w):
-    if w is None:
-        return None
-    if w < 14:
-        return 1
-    if w < 28:
-        return 2
+    if w is None: return None
+    if w < 14: return 1
+    if w < 28: return 2
     return 3
 
 def calendar_tip(weeks):
@@ -564,7 +559,7 @@ def not_found(e):
     return render_template("404.html"), 404
 
 # ---------------------------------------------------------------------
-# Webhook (Twilio -> WhatsApp) — com anti-trava e repetição de pergunta
+# Webhook (Twilio -> WhatsApp)
 # ---------------------------------------------------------------------
 @app.post("/whatsapp")
 def whatsapp_webhook():
@@ -574,10 +569,9 @@ def whatsapp_webhook():
     phone = from_raw.replace("whatsapp:", "")
 
     up = body.upper()
-    low = body.lower().strip()
 
     # Commands
-    if up in ("SAIR", "FIM"):
+    if up == "SAIR" or up == "FIM":
         end_session(phone)
         return twiml("Conversa encerrada. Obrigado por participar! Em emergência, 192 (SAMU).")
     if up == "REINICIAR":
@@ -607,18 +601,12 @@ def whatsapp_webhook():
         if up.startswith("?"):
             return twiml("Não encontrei esse tópico. Digite *MENU* para ver as opções ou *CONTINUAR* para seguir o questionário.")
 
-    # Consentimento
     if not consented:
         if up == "ACEITO":
             save_session(phone, 1, data, 1)
             return twiml(CONSENT_CONFIRMED + "\n\n" + QUESTIONS[1])
         else:
             return twiml("Para iniciar, digite *ACEITO*. Para sair, digite SAIR.")
-
-    # Saudações comuns → repete a pergunta atual (evita sensação de travado)
-    GREETINGS = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "hello", "hi"}
-    if low in GREETINGS:
-        return twiml(QUESTIONS.get(state, "Vamos continuar."))
 
     # Estado especial: repetir a pergunta corrente
     if up == "CONTINUAR":
@@ -645,7 +633,7 @@ def whatsapp_webhook():
         elif state == 3:
             weeks = parse_dum_or_weeks(body)
             if weeks is None:
-                return twiml("Não entendi.\n\n" + QUESTIONS[3])
+                return twiml("Não entendi. Envie *DD/MM/AAAA* (DUM) ou apenas *semanas* (ex.: 22).")
             data["ga_weeks"] = weeks
             save_session(phone, 4, data, 1)
             return twiml(QUESTIONS[4])
@@ -654,7 +642,7 @@ def whatsapp_webhook():
             ids = {s.strip() for s in body.replace(";",",").split(",") if s.strip()}
             valid = {"1","2","3","4","5","6","7"}
             if not ids or not ids.issubset(valid):
-                return twiml("Não entendi.\n\n" + QUESTIONS[4])
+                return twiml("Responda com os *números* dos sintomas (ex.: 1,3).")
             data["sintomas_ids"] = sorted(list(ids))
             save_session(phone, 5, data, 1)
             return twiml(QUESTIONS[5])
@@ -663,7 +651,7 @@ def whatsapp_webhook():
             ids = {s.strip() for s in body.replace(";",",").split(",") if s.strip()}
             valid = {"1","2","3","4"}
             if not ids or not ids.issubset(valid):
-                return twiml("Não entendi.\n\n" + QUESTIONS[5])
+                return twiml("Responda com os *números* das condições (ex.: 1,4).")
             data["comorb_ids"] = sorted(list(ids))
             save_session(phone, 6, data, 1)
             return twiml(QUESTIONS[6])
@@ -675,7 +663,7 @@ def whatsapp_webhook():
                     return twiml("Informe um número *válido* de consultas (ex.: 3).")
                 data["consultas_qtd"] = consultas
             except Exception:
-                return twiml("Não entendi.\n\n" + QUESTIONS[6])
+                return twiml("Responda com *número* (ex.: 3).")
             save_session(phone, 7, data, 1)
             return twiml(QUESTIONS[7])
 
@@ -686,7 +674,7 @@ def whatsapp_webhook():
             else:
                 s, d = parse_bp(body)
                 if not s or not d:
-                    return twiml("Não entendi.\n\n" + QUESTIONS[7])
+                    return twiml("Formato inválido. Envie como *12x8*, *12/8*, *12 8* ou *120/80* (ou digite *PULAR*).")
                 data["pa_sys"] = s
                 data["pa_dia"] = d
             save_session(phone, 8, data, 1)
@@ -698,7 +686,7 @@ def whatsapp_webhook():
             else:
                 w = parse_kg(body)
                 if w is None:
-                    return twiml("Não entendi.\n\n" + QUESTIONS[8])
+                    return twiml("Informe apenas o *peso em kg* (ex.: 70) ou digite *PULAR*.")
                 data["peso"] = w
             if data.get("peso") and data.get("altura"):
                 data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
@@ -713,7 +701,7 @@ def whatsapp_webhook():
             else:
                 h = parse_meters(body)
                 if h is None:
-                    return twiml("Não entendi.\n\n" + QUESTIONS[9])
+                    return twiml("Informe apenas a *altura em metros* (ex.: 1.60) ou digite *PULAR*.")
                 data["altura"] = h
             if data.get("peso") and data.get("altura"):
                 data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
