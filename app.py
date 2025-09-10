@@ -7,6 +7,7 @@ from dateutil import parser as dateparser
 from flask import Flask, request, Response, render_template
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
+from flask import render_template, render_template_string
 
 # ---------------------------------------------------------------------
 # Setup
@@ -369,9 +370,17 @@ def index():
         "/health (GET), /whatsapp (POST, Twilio webhook), /export.csv (GET)."
     )
 
+# SUBSTITUA seu handler 404 por este:
 @app.errorhandler(404)
 def not_found(e):
-    return render_template("404.html"), 404
+    try:
+        return render_template("404.html"), 404
+    except Exception:
+        # fallback se o template não existir
+        return Response(
+            "404 – Página não encontrada. Endpoints: /health (GET), /whatsapp (POST), /whatsapp-test (GET/POST), /export.csv (GET)",
+            mimetype="text/plain"
+        ), 404
 
 # ---------------------------------------------------------------------
 # Webhook (Twilio -> WhatsApp)
