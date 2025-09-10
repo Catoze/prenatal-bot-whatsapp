@@ -24,12 +24,11 @@ def db():
 def init_db():
     conn = db()
     cur = conn.cursor()
-    # Fluxo
     cur.execute("""
         CREATE TABLE IF NOT EXISTS sessions (
             phone TEXT PRIMARY KEY,
             state INTEGER NOT NULL,
-            data  TEXT    NOT NULL,
+            data TEXT NOT NULL,
             consented INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
@@ -39,33 +38,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS responses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             phone TEXT NOT NULL,
-            data  TEXT NOT NULL,
+            data TEXT NOT NULL,
             risk_level TEXT NOT NULL,
             ga_weeks INTEGER,
             created_at TEXT NOT NULL
         )
     """)
-    # Base de conhecimento (RAG local com FTS5)
-    try:
-        cur.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts
-            USING fts5(
-                title,
-                body,
-                tags,
-                tokenize = 'unicode61 remove_diacritics 2'
-            );
-        """)
-    except sqlite3.OperationalError:
-        # FTS5 não disponível na build do SQLite — segue sem RAG
-        pass
     conn.commit()
     conn.close()
 
 init_db()
 
 # ---------------------------------------------------------------------
-# Educational/FAQ (RAG lexical + FTS5/BM25; opcional resumo por LLM)
+# Educational/FAQ (RAG lexical por palavras-chave)
 # ---------------------------------------------------------------------
 def _t(s):  # minify multiline text
     return re.sub(r"[ \t]+\n", "\n", s.strip())
@@ -137,126 +122,14 @@ FAQ_MENU = _t("""
 (Use `MENU` para ver esta lista; `CONTINUAR` volta ao questionário.)
 """)
 
-# ---------- RAG (FTS5 + BM25) ----------
-def ensure_kb_seed():
-    """Carrega o FAQ_TOPICS na FTS5 (só se estiver vazia). Ignora se FTS não existir."""
-    try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM kb_fts LIMIT 1")
-        # Se chegou aqui, kb_fts existe. Verifica vazio:
-        count = cur.execute("SELECT count(*) FROM kb_fts").fetchone()[0]
-        if count == 0:
-            rows = []
-            for keys, body in FAQ_TOPICS.items():
-                title = list(keys)[0]
-                tags = ", ".join(keys)
-                rows.append((title, body.strip(), tags))
-            cur.executemany("INSERT INTO kb_fts (title, body, tags) VALUES (?,?,?)", rows)
-            conn.commit()
-        conn.close()
-    except Exception:
-        # Sem FTS5 ou erro — segue com o dicionário em memória
-        pass
-
-ensure_kb_seed()
-
-def _fts_query_from_text(q: str) -> str:
-    toks = re.findall(r"\w{3,}", q.lower())
-    if not toks:
-        return ""
-    return " ".join([t + "*" for t in toks])
-
-def kb_search_raw(query: str, k: int = 3):
-    """Busca BM25 na FTS e retorna [{title, snippet, body, score}, ...]."""
-    q = _fts_query_from_text(query)
-    if not q:
-        return []
-    try:
-        conn = db()
-        cur = conn.cursor()
-        sql = """
-          SELECT
-            title,
-            snippet(kb_fts, 1, '*', '*', '…', 10) AS snip,
-            body,
-            bm25(kb_fts) AS score
-          FROM kb_fts
-          WHERE kb_fts MATCH ?
-          ORDER BY score
-          LIMIT ?
-        """
-        rows = []
-        for r in cur.execute(sql, (q, k)):
-            rows.append({"title": r[0], "snippet": r[1] or r[2], "body": r[2], "score": r[3]})
-        conn.close()
-        return rows
-    except Exception:
-        return []
-
-# ---------- LLM opcional para resumir passagens (OpenAI/Gemini) ----------
-LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").lower()
-SAFETY_SYSTEM = (
-    "Você é um assistente educativo em saúde materna. Responda em português, "
-    "curto e claro, sem diagnosticar nem prescrever. Em sinais de alerta, "
-    "oriente procurar serviço de saúde/SAMU 192."
-)
-
-def llm_summarize(question: str, passages: list[str]) -> str | None:
-    if not passages:
-        return None
-    try:
-        if LLM_PROVIDER == "openai":
-            from openai import OpenAI
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            prompt = (
-                f"{SAFETY_SYSTEM}\n\nPERGUNTA:\n{question}\n\n"
-                f"FONTES:\n- " + "\n- ".join(passages) +
-                "\n\nResponda objetivamente (bullets quando útil)."
-            )
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=300,
-            )
-            return (resp.choices[0].message.content or "").strip()
-
-        elif LLM_PROVIDER == "gemini":
-            import google.generativeai as genai
-            genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            model = genai.GenerativeModel("gemini-1.5-flash")
-            prompt = (
-                f"{SAFETY_SYSTEM}\n\nPERGUNTA:\n{question}\n\n"
-                f"FONTES:\n- " + "\n- ".join(passages) +
-                "\n\nResponda objetivamente (bullets quando útil)."
-            )
-            resp = model.generate_content(prompt)
-            return (getattr(resp, "text", "") or "").strip()
-    except Exception:
-        return None
-    return None
-
-def answer_faq(text: str, data: dict | None = None) -> str | None:
-    """1) match por palavras-chave; 2) FTS5/BM25; 3) resumo opcional via LLM."""
+def answer_faq(text: str) -> str | None:
     t = text.lower().strip()
     if t.startswith("?"):
         t = t[1:].strip()
-
     for keys, msg in FAQ_TOPICS.items():
         if any(k in t for k in keys):
             return msg
-
-    hits = kb_search_raw(t, k=3)
-    if not hits:
-        return None
-
-    summary = llm_summarize(text, [h["body"] for h in hits])
-    if summary:
-        return summary
-
-    bullets = [f"• *{h['title'].capitalize()}*: {h['snippet']}" for h in hits]
-    return "*Informações relacionadas:*\n" + "\n".join(bullets)
+    return None
 
 # ---------------------------------------------------------------------
 # Questionnaire & helpers
@@ -326,12 +199,14 @@ ALERTA_BASE = (
 
 def parse_dum_or_weeks(text):
     text = text.strip()
+    # Try weeks as number
     try:
         w = int(text)
         if 0 <= w <= 45:
             return w
     except ValueError:
         pass
+    # Try date dd/mm/yyyy
     try:
         dt = datetime.strptime(text, "%d/%m/%Y").date()
         days = (date.today() - dt).days
@@ -350,16 +225,22 @@ def parse_dum_or_weeks(text):
     return None
 
 def parse_bp(text):
-    """Aceita: 12x8, 12/8, 12 8, 120/80. Converte 12/8 -> 120/80."""
+    """
+    Aceita: "12x8", "12/8", "12 8", "120/80".
+    Se valores forem estilo '12' e '8', converte para 120/80.
+    Retorna (sistólica, diastólica) ou (None, None).
+    """
     t = text.lower().replace(",", ".").strip()
     t = t.replace("x", "/").replace(" ", "/")
     m = re.search(r"(\d{2,3})\s*/\s*(\d{1,3})", t)
     if not m:
         return None, None
     try:
-        s = int(m.group(1)); d = int(m.group(2))
-        if s < 30 and d < 30:
-            s *= 10; d *= 10
+        s = int(m.group(1))
+        d = int(m.group(2))
+        if s < 30 and d < 30:  # 12/8 -> 120/80
+            s *= 10
+            d *= 10
         if 60 <= s <= 260 and 30 <= d <= 180:
             return s, d
     except Exception:
@@ -393,9 +274,12 @@ def parse_meters(text):
     return None
 
 def trimester_from_weeks(w):
-    if w is None: return None
-    if w < 14: return 1
-    if w < 28: return 2
+    if w is None:
+        return None
+    if w < 14:
+        return 1
+    if w < 28:
+        return 2
     return 3
 
 def calendar_tip(weeks):
@@ -428,7 +312,7 @@ def vaccines_tip(weeks):
     return "\n".join(tips)
 
 def educational_pack(data, risk_level):
-    """Retorna material educativo personalizado."""
+    """Retorna texto educativo personalizado conforme dados e risco."""
     weeks = data.get("ga_weeks")
     imc = data.get("imc")
     sys = data.get("pa_sys")
@@ -437,6 +321,7 @@ def educational_pack(data, risk_level):
     habitos = data.get("habitos")
 
     block = []
+    # Cabeçalho resumido por risco
     if risk_level == "EMERGENTE":
         block.append("*Prioridade:* sinais de gravidade detectados. Procure *emergência agora* / 192.")
     elif risk_level == "PRIORITÁRIO":
@@ -444,23 +329,32 @@ def educational_pack(data, risk_level):
     else:
         block.append("*Rotina:* manter acompanhamento e autocuidados.")
 
+    # Calendário + exames + vacinas
     block.append(calendar_tip(weeks))
     block.append(trimester_exams(weeks))
     block.append(vaccines_tip(weeks))
 
+    # Personalizações
     if imc and imc >= 30:
         block.append("• IMC elevado (≥30): foco em alimentação equilibrada, atividade leve e metas de ganho de peso orientadas pela equipe.")
     if (sys and dia) and (sys >= 140 or dia >= 90):
         block.append("• Pressão arterial elevada: meça em horários regulares e leve os registros à sua unidade.")
-    if "2" in comorb:
+    if "2" in comorb:  # diabetes
         block.append("• Diabetes/risco: siga orientações de dieta, atividade e metas glicêmicas; TOTG 24–28s se ainda não realizou.")
-    if "1" in comorb:
+    if "1" in comorb:  # hipertensão
         block.append("• Hipertensão: atenção a cefaleia forte, escotomas, dor em “boca do estômago” e inchaço súbito.")
     if habitos == "sim":
         block.append("• Tabaco/álcool: interromper traz benefício imediato; busque apoio na sua unidade.")
 
+    # Sinais de alerta sempre ao final
     block.append("\n" + ALERTA_BASE)
-    block.append("\nTem dúvidas? Envie `? tema` (ex.: `? pressão alta`, `? alimentação`) ou `MENU` para a lista. Para encerrar, mande *FIM*.")
+
+    # Ajuda/continuidade
+    block.append(
+        "\nTem dúvidas? Envie `? tema` (ex.: `? pressão alta`, `? alimentação`) ou `MENU` para a lista. "
+        "Para encerrar, mande *FIM*."
+    )
+
     return "\n".join(block)
 
 def classify_risk(record):
@@ -474,17 +368,20 @@ def classify_risk(record):
     imc = record.get("imc")
     habitos = record.get("habitos")  # 'sim'/'nao'
 
+    # Emergente
     if sintomas & SEVERE_SYMPTOM_IDS:
         return ("EMERGENTE", "Sintoma(s) de alerta reportado(s). Orientar ida IMEDIATA ao serviço / 192.")
     if sys and dia and (sys >= 160 or dia >= 110):
         return ("EMERGENTE", "Pressão arterial muito elevada (≥160/110). Procurar emergência.")
 
+    # Priority
     priority_reasons = []
     try:
         if age is not None and (age < 18 or age >= 35):
             priority_reasons.append("Faixa etária (<18 ou ≥35) pode elevar riscos obstétricos; acompanhamento mais próximo é recomendado.")
     except Exception:
         pass
+
     if {"1","2","3"} & comorb:
         priority_reasons.append("Comorbidade (hipertensão/diabetes/ITU).")
     if weeks is not None and weeks >= 28 and "6" in sintomas:
@@ -498,6 +395,7 @@ def classify_risk(record):
 
     if priority_reasons:
         return ("PRIORITÁRIO", "; ".join(priority_reasons) + " Para saber mais, envie `? faixa etária` ou `? pressão alta`. Orientar avaliação em breve (hoje/amanhã).")
+
     return ("ROTINA", "Sem sinais de alerta no momento. Manter acompanhamento de pré-natal e orientações gerais.")
 
 def get_session(phone):
@@ -550,7 +448,7 @@ def twiml(message):
 @app.get("/")
 def index():
     return (
-        "Chatbot Pré-Natal online (WhatsApp + RAG local FTS5/BM25 + LLM opcional). Endpoints: "
+        "Chatbot Pré-Natal online. Endpoints: "
         "/health (GET), /whatsapp (POST, Twilio webhook), /export.csv (GET)."
     )
 
@@ -595,7 +493,7 @@ def whatsapp_webhook():
         "alimentação","vacina","sinais de alerta","consultas","exames",
         "diabetes","pressão","prematuro","primeira consulta","sintomas","faixa etária"
     ]):
-        ans = answer_faq(body, data)
+        ans = answer_faq(body)
         if ans:
             return twiml(ans + "\n\nDigite *CONTINUAR* para voltar ao questionário, *MENU* para ver mais tópicos ou *FIM* para encerrar.")
         if up.startswith("?"):
@@ -735,6 +633,7 @@ def whatsapp_webhook():
 
         elif state == 11:
             if body.strip() == "1":
+                # Pacote educativo personalizado
                 risk_level, _ = classify_risk(data)
                 pack = educational_pack(data, risk_level)
                 save_session(phone, 12, data, 1)
@@ -746,18 +645,20 @@ def whatsapp_webhook():
                 return twiml("Responda 1 para *Sim* ou 2 para *Não*.")
 
         elif state == 12:
+            # Após pacote educativo: aceitar MENU/?/FIM/CONTINUAR
             if up in ("FIM", "SAIR"):
                 end_session(phone)
                 return twiml("Conversa encerrada. Obrigado por participar! Em emergência, 192 (SAMU).")
             if up == "MENU":
                 return twiml(FAQ_MENU)
             if up.startswith("?"):
-                ans = answer_faq(body, data)
+                ans = answer_faq(body)
                 if ans:
                     return twiml(ans + "\n\nDigite *MENU* para mais tópicos ou *FIM* para encerrar.")
                 return twiml("Não encontrei esse tópico. Digite *MENU* para ver as opções ou *FIM* para encerrar.")
             if up == "CONTINUAR":
                 return twiml("Podemos continuar pelo *MENU* (envie `MENU`) ou encerrar com *FIM*.")
+            # Qualquer outra coisa:
             return twiml("Se quiser mais informações, envie `MENU` ou `? tema` (ex.: `? alimentação`). Para encerrar, mande *FIM*.")
 
         else:
