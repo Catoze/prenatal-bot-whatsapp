@@ -635,3 +635,16 @@ def whatsapp_test():
     frm  = (request.values.get("From") or "whatsapp:+000").replace("whatsapp:", "")
     return twiml(f"✅ Webhook OK. Echo: '{body}' de {frm}")
 
+from flask import url_for
+
+def abs_static(path: str) -> str:
+    """Monta URL absoluta para algo em /static (precisa ser URL pública para o WhatsApp)."""
+    return request.url_root.rstrip("/") + url_for("static", filename=path.lstrip("/"))
+
+def twiml_msg(text: str, media: list[str] | None = None) -> Response:
+    """Envia texto + (opcional) 1..N imagens."""
+    r = MessagingResponse()
+    msg = r.message(text)
+    for m in (media or []):
+        msg.media(m)
+    return Response(str(r), mimetype="application/xml")
