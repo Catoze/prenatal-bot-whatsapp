@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Alô Gestante — Apresentação</title>
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --muted:#9ca3af; --ring:#3b82f6;}
+    *{box-sizing:border-box} body{margin:0;font:16px/1.55 system-ui,Segoe UI,Roboto,Arial}
+    header{background:#0b5bd7; color:#fff; padding:40px 16px; text-align:center}
+    header h1{margin:0; font-size:clamp(28px,5vw,44px)}
+    .wrap{max-width:1080px; margin:0 auto; padding:24px 16px}
+    .grid{display:grid; gap:22px}
+    @media(min-width:780px){ .grid{grid-template-columns:1fr 1fr}}
+    .card{background:#fff;border-radius:18px;box-shadow:0 8px 28px rgba(0,0,0,.08);overflow:hidden;border:1px solid #e5e7eb}
+    .card h3{margin:16px 18px 0}
+    .card p{margin:10px 18px 18px; color:#4b5563}
+    .hero{display:block;width:100%;height:auto}
+    footer{color:#6b7280;text-align:center;padding:28px}
+    .note{background:#eef2ff;border-left:4px solid #6366f1;padding:12px 14px;border-radius:12px;margin:18px 0}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Alô Gestante — Visão Geral</h1>
+    <p>Protótipo técnico + evidências para apoio ao pré-natal via WhatsApp</p>
+  </header>
+
+  <main class="wrap">
+    <div class="note">Enquanto o WhatsApp do sandbox estiver no limite diário, você pode compartilhar esta página ✨</div>
+
+    <section class="grid">
+      {% for img, title in images %}
+      <article class="card">
+        <img class="hero" src="{{ url_for('static', filename='img/site/' + img) }}" alt="{{ title }}" loading="lazy">
+        <h3>{{ title }}</h3>
+      </article>
+      {% endfor %}
+    </section>
+  </main>
+
+  <footer>© {{ year }} — Alô Gestante</footer>
+</body>
+</html>
