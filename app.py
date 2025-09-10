@@ -50,7 +50,7 @@ def init_db():
 init_db()
 
 # ---------------------------------------------------------------------
-# Educational/FAQ (RAG lexical por palavras-chave)
+# Educational/FAQ (resumos dos tópicos; usuário envia "? termo")
 # ---------------------------------------------------------------------
 def _t(s):  # minify multiline text
     return re.sub(r"[ \t]+\n", "\n", s.strip())
@@ -114,7 +114,7 @@ FAQ_TOPICS = {
 }
 
 FAQ_MENU = _t("""
-*Ajuda/Informações* — você pode enviar `? tema` ou escrever em linguagem natural (ex.: "dor de cabeça", "movimentos do bebê").
+*Ajuda/Informações* — envie:
 • `? primeira consulta` • `? consultas` • `? alimentação`
 • `? sintomas` • `? sinais de alerta` • `? vacinação`
 • `? exames` • `? diabetes` • `? pressão alta`
@@ -141,7 +141,7 @@ WELCOME = (
     "*Aviso*: este serviço NÃO substitui atendimento médico. Em emergência, ligue 192 (SAMU).\n\n"
     "Se você *concorda em participar* e autoriza o uso dos dados para fins acadêmicos "
     "conforme a LGPD, responda: *ACEITO*.\n\n"
-    "Comandos: *MENU*, *CONTINUAR*, *REINICIAR*, *FIM*, *SAIR*."
+    "Comandos: *MENU*, *CONTINUAR*, *REINICIAR*, *SAIR*."
 )
 
 CONSENT_CONFIRMED = "Obrigado. Consentimento registrado. Vamos começar com algumas perguntas rápidas."
@@ -183,18 +183,15 @@ QUESTIONS = {
 FINAL_MSG = "Obrigado. Avaliando suas respostas…"
 
 EDU_MSG = (
-    "Deseja receber *material educativo* (dicas personalizadas, sinais de alerta e calendário de consultas)?\n"
+    "Deseja receber *material educativo* (dicas de sinais de alerta e calendário de consultas)?\n"
     "Responda 1 para *Sim* ou 2 para *Não*."
 )
 
-# Conteúdo base para todos
-ALERTA_BASE = (
-    "*Sinais de alerta* — procurar serviço imediatamente / *192 SAMU*:\n"
-    "• Sangramento vaginal\n"
-    "• Dor abdominal forte\n"
-    "• Febre ≥38°C\n"
-    "• Dor de cabeça intensa/visão turva/inchaço súbito\n"
-    "• Ausência de movimentos fetais após 28s"
+EDU_CONTENT = (
+    "*Sinais de alerta* (procure serviço imediatamente): sangramento, dor forte, febre ≥38°C, "
+    "dor de cabeça intensa/visão turva/inchaço súbito, ausência de movimentos fetais após 28s.\n\n"
+    "*Rotina*: mantenha o calendário de consultas do pré-natal e exames recomendados.\n"
+    "Em dúvida, procure sua unidade de referência. Emergência: 192."
 )
 
 def parse_dum_or_weeks(text):
@@ -231,6 +228,7 @@ def parse_bp(text):
     Retorna (sistólica, diastólica) ou (None, None).
     """
     t = text.lower().replace(",", ".").strip()
+    # normaliza separadores
     t = t.replace("x", "/").replace(" ", "/")
     m = re.search(r"(\d{2,3})\s*/\s*(\d{1,3})", t)
     if not m:
@@ -238,7 +236,8 @@ def parse_bp(text):
     try:
         s = int(m.group(1))
         d = int(m.group(2))
-        if s < 30 and d < 30:  # 12/8 -> 120/80
+        # Se veio "12/8", multiplica por 10 -> 120/80
+        if s < 30 and d < 30:
             s *= 10
             d *= 10
         if 60 <= s <= 260 and 30 <= d <= 180:
@@ -248,6 +247,7 @@ def parse_bp(text):
     return None, None
 
 def parse_kg(text):
+    """retorna peso em kg (float) se válido; aceita '70', '70,5', '70kg'."""
     t = text.lower().replace(",", ".")
     m = re.search(r"(\d+(\.\d+)?)", t)
     if not m:
@@ -261,6 +261,7 @@ def parse_kg(text):
     return None
 
 def parse_meters(text):
+    """retorna altura em metros (float) se válido; aceita '1.60', '1,60', '1.60m'."""
     t = text.lower().replace(",", ".")
     m = re.search(r"(\d+(\.\d+)?)", t)
     if not m:
@@ -272,90 +273,6 @@ def parse_meters(text):
     except Exception:
         pass
     return None
-
-def trimester_from_weeks(w):
-    if w is None:
-        return None
-    if w < 14:
-        return 1
-    if w < 28:
-        return 2
-    return 3
-
-def calendar_tip(weeks):
-    if weeks is None:
-        return "• Consultas: mensais até 34s; quinzenais 34–36s; semanais >36s."
-    if weeks < 34:
-        return "• Consultas: mensais até 34s; depois quinzenais."
-    if weeks < 36:
-        return "• Consultas: quinzenais até 36s; depois semanais."
-    return "• Consultas: semanais a partir de 36s."
-
-def trimester_exams(weeks):
-    tri = trimester_from_weeks(weeks)
-    if tri == 1:
-        return "• 1º tri: hemograma, tipagem/Rh, glicemia, sorologias, urina/urocultura, US obstétrico."
-    if tri == 2:
-        return "• 2º tri: TOTG 24–28s, US morfológico."
-    if tri == 3:
-        return "• 3º tri: hemograma, sorologias de controle, cultura para EGB 35–37s."
-    return "• Exames por trimestre variam; siga o pedido da sua unidade."
-
-def vaccines_tip(weeks):
-    tips = []
-    if weeks is None:
-        tips.append("• Vacinas: Influenza (anual), Hep. B e COVID-19 conforme indicação; dTpa entre 20–36s.")
-    else:
-        if 20 <= weeks <= 36:
-            tips.append("• dTpa entre 20–36s.")
-        tips.append("• Influenza (anual), Hep. B e COVID-19 conforme indicação.")
-    return "\n".join(tips)
-
-def educational_pack(data, risk_level):
-    """Retorna texto educativo personalizado conforme dados e risco."""
-    weeks = data.get("ga_weeks")
-    imc = data.get("imc")
-    sys = data.get("pa_sys")
-    dia = data.get("pa_dia")
-    comorb = set(data.get("comorb_ids", []))
-    habitos = data.get("habitos")
-
-    block = []
-    # Cabeçalho resumido por risco
-    if risk_level == "EMERGENTE":
-        block.append("*Prioridade:* sinais de gravidade detectados. Procure *emergência agora* / 192.")
-    elif risk_level == "PRIORITÁRIO":
-        block.append("*Prioridade:* avaliação em breve (hoje/amanhã) na sua unidade.")
-    else:
-        block.append("*Rotina:* manter acompanhamento e autocuidados.")
-
-    # Calendário + exames + vacinas
-    block.append(calendar_tip(weeks))
-    block.append(trimester_exams(weeks))
-    block.append(vaccines_tip(weeks))
-
-    # Personalizações
-    if imc and imc >= 30:
-        block.append("• IMC elevado (≥30): foco em alimentação equilibrada, atividade leve e metas de ganho de peso orientadas pela equipe.")
-    if (sys and dia) and (sys >= 140 or dia >= 90):
-        block.append("• Pressão arterial elevada: meça em horários regulares e leve os registros à sua unidade.")
-    if "2" in comorb:  # diabetes
-        block.append("• Diabetes/risco: siga orientações de dieta, atividade e metas glicêmicas; TOTG 24–28s se ainda não realizou.")
-    if "1" in comorb:  # hipertensão
-        block.append("• Hipertensão: atenção a cefaleia forte, escotomas, dor em “boca do estômago” e inchaço súbito.")
-    if habitos == "sim":
-        block.append("• Tabaco/álcool: interromper traz benefício imediato; busque apoio na sua unidade.")
-
-    # Sinais de alerta sempre ao final
-    block.append("\n" + ALERTA_BASE)
-
-    # Ajuda/continuidade
-    block.append(
-        "\nTem dúvidas? Envie `? tema` (ex.: `? pressão alta`, `? alimentação`) ou `MENU` para a lista. "
-        "Para encerrar, mande *FIM*."
-    )
-
-    return "\n".join(block)
 
 def classify_risk(record):
     """Return (risk_level, rationale)"""
@@ -469,9 +386,9 @@ def whatsapp_webhook():
     up = body.upper()
 
     # Commands
-    if up == "SAIR" or up == "FIM":
+    if up == "SAIR":
         end_session(phone)
-        return twiml("Conversa encerrada. Obrigado por participar! Em emergência, 192 (SAMU).")
+        return twiml("Ok, conversa encerrada. Seus dados não serão mais coletados.")
     if up == "REINICIAR":
         end_session(phone)
         save_session(phone, 0, {}, 0)
@@ -495,7 +412,7 @@ def whatsapp_webhook():
     ]):
         ans = answer_faq(body)
         if ans:
-            return twiml(ans + "\n\nDigite *CONTINUAR* para voltar ao questionário, *MENU* para ver mais tópicos ou *FIM* para encerrar.")
+            return twiml(ans + "\n\nDigite *CONTINUAR* para voltar ao questionário, ou *MENU* para ver mais tópicos.")
         if up.startswith("?"):
             return twiml("Não encontrei esse tópico. Digite *MENU* para ver as opções ou *CONTINUAR* para seguir o questionário.")
 
@@ -586,6 +503,7 @@ def whatsapp_webhook():
                 if w is None:
                     return twiml("Informe apenas o *peso em kg* (ex.: 70) ou digite *PULAR*.")
                 data["peso"] = w
+            # recalcula IMC se já houver altura
             if data.get("peso") and data.get("altura"):
                 data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
             else:
@@ -601,6 +519,7 @@ def whatsapp_webhook():
                 if h is None:
                     return twiml("Informe apenas a *altura em metros* (ex.: 1.60) ou digite *PULAR*.")
                 data["altura"] = h
+            # recalcula IMC se já houver peso
             if data.get("peso") and data.get("altura"):
                 data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
             else:
@@ -613,6 +532,7 @@ def whatsapp_webhook():
                 return twiml("Responda *1* para Sim ou *2* para Não.")
             data["habitos"] = "sim" if body.strip() == "1" else "nao"
 
+            # Classificar
             risk_level, rationale = classify_risk(data)
             store_response(phone, data, risk_level, data.get("ga_weeks"))
             save_session(phone, 11, data, 1)
@@ -633,33 +553,13 @@ def whatsapp_webhook():
 
         elif state == 11:
             if body.strip() == "1":
-                # Pacote educativo personalizado
-                risk_level, _ = classify_risk(data)
-                pack = educational_pack(data, risk_level)
-                save_session(phone, 12, data, 1)
-                return twiml(pack)
+                end_session(phone)
+                return twiml(EDU_CONTENT + "\n\nConversa finalizada. Obrigado por participar!")
             elif body.strip() == "2":
                 end_session(phone)
                 return twiml("Ok, sem material adicional. Conversa finalizada. Obrigado por participar!")
             else:
                 return twiml("Responda 1 para *Sim* ou 2 para *Não*.")
-
-        elif state == 12:
-            # Após pacote educativo: aceitar MENU/?/FIM/CONTINUAR
-            if up in ("FIM", "SAIR"):
-                end_session(phone)
-                return twiml("Conversa encerrada. Obrigado por participar! Em emergência, 192 (SAMU).")
-            if up == "MENU":
-                return twiml(FAQ_MENU)
-            if up.startswith("?"):
-                ans = answer_faq(body)
-                if ans:
-                    return twiml(ans + "\n\nDigite *MENU* para mais tópicos ou *FIM* para encerrar.")
-                return twiml("Não encontrei esse tópico. Digite *MENU* para ver as opções ou *FIM* para encerrar.")
-            if up == "CONTINUAR":
-                return twiml("Podemos continuar pelo *MENU* (envie `MENU`) ou encerrar com *FIM*.")
-            # Qualquer outra coisa:
-            return twiml("Se quiser mais informações, envie `MENU` ou `? tema` (ex.: `? alimentação`). Para encerrar, mande *FIM*.")
 
         else:
             end_session(phone)
