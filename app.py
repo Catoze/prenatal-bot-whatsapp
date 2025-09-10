@@ -2,9 +2,10 @@ import os
 import re
 import json
 import sqlite3
+from functools import lru_cache
 from datetime import datetime, date
-from dateutil import parser as dateparser
-from flask import Flask, request, Response, render_template
+
+from flask import Flask, request, Response, render_template, g
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
@@ -16,13 +17,38 @@ app = Flask(__name__, template_folder="templates")
 
 DB_PATH = os.getenv("DB_PATH", "prenatal.db")
 
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Performance toggles (use variáveis de ambiente)
+USE_LLM = (os.getenv("USE_LLM", "0").lower() in ("1", "true", "yes"))
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").lower()
+LLM_ONLY_ON_QMARK = (os.getenv("LLM_ONLY_ON_QMARK", "1").lower() in ("1", "true", "yes"))
+FAQ_HITS = int(os.getenv("FAQ_HITS", "3"))  # top-k da FTS
+FAST_SNIPPET_TOKENS = int(os.getenv("FAST_SNIPPET_TOKENS", "8"))
+
+# ---------------------------------------------------------------------
+# SQLite helpers (uma conexão por request + PRAGMAs rápidos)
+# ---------------------------------------------------------------------
+def get_db():
+    if "db" not in g:
+        conn = sqlite3.connect(
+            DB_PATH, check_same_thread=False, timeout=float(os.getenv("SQLITE_TIMEOUT", "3.0"))
+        )
+        conn.row_factory = sqlite3.Row
+        # PRAGMAs para reduzir latência em escrita/leituras curtas
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
+        conn.execute(f"PRAGMA busy_timeout={int(float(os.getenv('SQLITE_BUSY_MS', '1500')))};")
+        g.db = conn
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exception):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
 def init_db():
-    conn = db()
+    conn = get_db()
     cur = conn.cursor()
     # Fluxo
     cur.execute("""
@@ -46,6 +72,8 @@ def init_db():
         )
     """)
     # Base de conhecimento (RAG local com FTS5)
+    global HAS_FTS
+    HAS_FTS = True
     try:
         cur.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts
@@ -57,17 +85,16 @@ def init_db():
             );
         """)
     except sqlite3.OperationalError:
-        # FTS5 não disponível na build do SQLite — segue sem RAG
-        pass
+        HAS_FTS = False  # FTS5 indisponível na build do SQLite
     conn.commit()
-    conn.close()
 
-init_db()
+with app.app_context():
+    init_db()
 
 # ---------------------------------------------------------------------
-# Educational/FAQ (RAG lexical + FTS5/BM25; opcional resumo por LLM)
+# Educational/FAQ (RAG lexical + FTS5/BM25; LLM opcional e desativado por padrão)
 # ---------------------------------------------------------------------
-def _t(s):  # minify multiline text
+def _t(s: str) -> str:
     return re.sub(r"[ \t]+\n", "\n", s.strip())
 
 FAQ_TOPICS = {
@@ -137,16 +164,15 @@ FAQ_MENU = _t("""
 (Use `MENU` para ver esta lista; `CONTINUAR` volta ao questionário.)
 """)
 
-# ---------- RAG (FTS5 + BM25) ----------
+# Semeia a FTS apenas uma vez
 def ensure_kb_seed():
-    """Carrega o FAQ_TOPICS na FTS5 (só se estiver vazia). Ignora se FTS não existir."""
+    if not HAS_FTS:
+        return
+    conn = get_db()
+    cur = conn.cursor()
     try:
-        conn = db()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM kb_fts LIMIT 1")
-        # Se chegou aqui, kb_fts existe. Verifica vazio:
-        count = cur.execute("SELECT count(*) FROM kb_fts").fetchone()[0]
-        if count == 0:
+        cnt = cur.execute("SELECT count(*) FROM kb_fts").fetchone()[0]
+        if cnt == 0:
             rows = []
             for keys, body in FAQ_TOPICS.items():
                 title = list(keys)[0]
@@ -154,48 +180,51 @@ def ensure_kb_seed():
                 rows.append((title, body.strip(), tags))
             cur.executemany("INSERT INTO kb_fts (title, body, tags) VALUES (?,?,?)", rows)
             conn.commit()
-        conn.close()
-    except Exception:
-        # Sem FTS5 ou erro — segue com o dicionário em memória
+    except sqlite3.Error:
         pass
 
-ensure_kb_seed()
+with app.app_context():
+    ensure_kb_seed()
 
+@lru_cache(maxsize=4096)
 def _fts_query_from_text(q: str) -> str:
-    toks = re.findall(r"\w{3,}", q.lower())
+    toks = re.findall(r"\w{3,}", (q or "").lower())
     if not toks:
         return ""
     return " ".join([t + "*" for t in toks])
 
-def kb_search_raw(query: str, k: int = 3):
-    """Busca BM25 na FTS e retorna [{title, snippet, body, score}, ...]."""
+@lru_cache(maxsize=2048)
+def kb_search_cached(qnorm: str, k: int):
+    """Consulta FTS com cache (rápido se os dados não mudam)."""
+    if not HAS_FTS or not qnorm:
+        return []
+    conn = get_db()
+    cur = conn.cursor()
+    sql = f"""
+      SELECT
+        title,
+        snippet(kb_fts, 1, '*', '*', '…', {FAST_SNIPPET_TOKENS}) AS snip,
+        body,
+        bm25(kb_fts) AS score
+      FROM kb_fts
+      WHERE kb_fts MATCH ?
+      ORDER BY score
+      LIMIT ?
+    """
+    rows = []
+    try:
+        for r in cur.execute(sql, (qnorm, k)):
+            rows.append({"title": r[0], "snippet": r[1] or r[2], "body": r[2], "score": r[3]})
+    except sqlite3.Error:
+        return []
+    return rows
+
+def kb_search_raw(query: str, k: int = FAQ_HITS):
     q = _fts_query_from_text(query)
     if not q:
         return []
-    try:
-        conn = db()
-        cur = conn.cursor()
-        sql = """
-          SELECT
-            title,
-            snippet(kb_fts, 1, '*', '*', '…', 10) AS snip,
-            body,
-            bm25(kb_fts) AS score
-          FROM kb_fts
-          WHERE kb_fts MATCH ?
-          ORDER BY score
-          LIMIT ?
-        """
-        rows = []
-        for r in cur.execute(sql, (q, k)):
-            rows.append({"title": r[0], "snippet": r[1] or r[2], "body": r[2], "score": r[3]})
-        conn.close()
-        return rows
-    except Exception:
-        return []
+    return kb_search_cached(q, k)
 
-# ---------- LLM opcional para resumir passagens (OpenAI/Gemini) ----------
-LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").lower()
 SAFETY_SYSTEM = (
     "Você é um assistente educativo em saúde materna. Responda em português, "
     "curto e claro, sem diagnosticar nem prescrever. Em sinais de alerta, "
@@ -203,7 +232,10 @@ SAFETY_SYSTEM = (
 )
 
 def llm_summarize(question: str, passages: list[str]) -> str | None:
-    if not passages:
+    if not (USE_LLM and passages):
+        return None
+    # usa LLM apenas se a pergunta começar com "?"
+    if LLM_ONLY_ON_QMARK and not (question or "").strip().startswith("?"):
         return None
     try:
         if LLM_PROVIDER == "openai":
@@ -215,17 +247,17 @@ def llm_summarize(question: str, passages: list[str]) -> str | None:
                 "\n\nResponda objetivamente (bullets quando útil)."
             )
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=300,
+                temperature=0.1,
+                max_tokens=int(os.getenv("LLM_MAX_TOKENS", "280")),
             )
             return (resp.choices[0].message.content or "").strip()
 
         elif LLM_PROVIDER == "gemini":
             import google.generativeai as genai
             genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
-            model = genai.GenerativeModel("gemini-1.5-flash")
+            model = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
             prompt = (
                 f"{SAFETY_SYSTEM}\n\nPERGUNTA:\n{question}\n\n"
                 f"FONTES:\n- " + "\n- ".join(passages) +
@@ -239,15 +271,16 @@ def llm_summarize(question: str, passages: list[str]) -> str | None:
 
 def answer_faq(text: str, data: dict | None = None) -> str | None:
     """1) match por palavras-chave; 2) FTS5/BM25; 3) resumo opcional via LLM."""
-    t = text.lower().strip()
+    t = (text or "").lower().strip()
     if t.startswith("?"):
         t = t[1:].strip()
 
+    # match direto ultrarrápido
     for keys, msg in FAQ_TOPICS.items():
         if any(k in t for k in keys):
             return msg
 
-    hits = kb_search_raw(t, k=3)
+    hits = kb_search_raw(t, k=FAQ_HITS)
     if not hits:
         return None
 
@@ -314,7 +347,6 @@ EDU_MSG = (
     "Responda 1 para *Sim* ou 2 para *Não*."
 )
 
-# Conteúdo base para todos
 ALERTA_BASE = (
     "*Sinais de alerta* — procurar serviço imediatamente / *192 SAMU*:\n"
     "• Sangramento vaginal\n"
@@ -324,38 +356,34 @@ ALERTA_BASE = (
     "• Ausência de movimentos fetais após 28s"
 )
 
-def parse_dum_or_weeks(text):
-    text = text.strip()
-    # Tenta semanas inteiras
+# Parsers (rápidos)
+BP_RE = re.compile(r"(\d{2,3})\s*/\s*(\d{1,3})")
+NUM_FLOAT_RE = re.compile(r"(\d+(?:\.\d+)?)")
+
+def parse_dum_or_weeks(text: str):
+    t = (text or "").strip()
+    # Semanas inteiras
     try:
-        w = int(text)
+        w = int(t)
         if 0 <= w <= 45:
             return w
-    except ValueError:
+    except Exception:
         pass
-    # Tenta data dd/mm/aaaa
+    # Data DD/MM/AAAA
     try:
-        dt = datetime.strptime(text, "%d/%m/%Y").date()
+        dt = datetime.strptime(t, "%d/%m/%Y").date()
         days = (date.today() - dt).days
         weeks = days // 7
         if 0 <= weeks <= 45:
             return weeks
     except Exception:
-        try:
-            dt = dateparser.parse(text, dayfirst=True).date()
-            days = (date.today() - dt).days
-            weeks = days // 7
-            if 0 <= weeks <= 45:
-                return weeks
-        except Exception:
-            return None
+        return None
     return None
 
-def parse_bp(text):
-    """Aceita: 12x8, 12/8, 12 8, 120/80. Converte 12/8 -> 120/80."""
-    t = text.lower().replace(",", ".").strip()
+def parse_bp(text: str):
+    t = (text or "").lower().replace(",", ".").strip()
     t = t.replace("x", "/").replace(" ", "/")
-    m = re.search(r"(\d{2,3})\s*/\s*(\d{1,3})", t)
+    m = BP_RE.search(t)
     if not m:
         return None, None
     try:
@@ -368,9 +396,9 @@ def parse_bp(text):
         pass
     return None, None
 
-def parse_kg(text):
-    t = text.lower().replace(",", ".")
-    m = re.search(r"(\d+(\.\d+)?)", t)
+def parse_kg(text: str):
+    t = (text or "").lower().replace(",", ".")
+    m = NUM_FLOAT_RE.search(t)
     if not m:
         return None
     try:
@@ -381,9 +409,9 @@ def parse_kg(text):
         pass
     return None
 
-def parse_meters(text):
-    t = text.lower().replace(",", ".")
-    m = re.search(r"(\d+(\.\d+)?)", t)
+def parse_meters(text: str):
+    t = (text or "").lower().replace(",", ".")
+    m = NUM_FLOAT_RE.search(t)
     if not m:
         return None
     try:
@@ -395,12 +423,9 @@ def parse_meters(text):
     return None
 
 def trimester_from_weeks(w):
-    if w is None:
-        return None
-    if w < 14:
-        return 1
-    if w < 28:
-        return 2
+    if w is None: return None
+    if w < 14: return 1
+    if w < 28: return 2
     return 3
 
 def calendar_tip(weeks):
@@ -433,7 +458,6 @@ def vaccines_tip(weeks):
     return "\n".join(tips)
 
 def educational_pack(data, risk_level):
-    """Retorna material educativo personalizado."""
     weeks = data.get("ga_weeks")
     imc = data.get("imc")
     sys = data.get("pa_sys")
@@ -469,7 +493,6 @@ def educational_pack(data, risk_level):
     return "\n".join(block)
 
 def classify_risk(record):
-    """Return (risk_level, rationale)"""
     age = record.get("idade")
     weeks = record.get("ga_weeks")
     sintomas = set(record.get("sintomas_ids", []))
@@ -477,7 +500,7 @@ def classify_risk(record):
     sys = record.get("pa_sys")
     dia = record.get("pa_dia")
     imc = record.get("imc")
-    habitos = record.get("habitos")  # 'sim'/'nao'
+    habitos = record.get("habitos")
 
     if sintomas & SEVERE_SYMPTOM_IDS:
         return ("EMERGENTE", "Sintoma(s) de alerta reportado(s). Orientar ida IMEDIATA ao serviço / 192.")
@@ -505,46 +528,40 @@ def classify_risk(record):
         return ("PRIORITÁRIO", "; ".join(priority_reasons) + " Para saber mais, envie `? faixa etária` ou `? pressão alta`. Orientar avaliação em breve (hoje/amanhã).")
     return ("ROTINA", "Sem sinais de alerta no momento. Manter acompanhamento de pré-natal e orientações gerais.")
 
-def get_session(phone):
-    conn = db()
-    cur = conn.cursor()
+# ---------------------------------------------------------------------
+# Sessions & storage
+# ---------------------------------------------------------------------
+def get_session(phone: str):
+    cur = get_db().cursor()
     cur.execute("SELECT * FROM sessions WHERE phone = ?", (phone,))
-    row = cur.fetchone()
-    conn.close()
-    return row
+    return cur.fetchone()
 
-def save_session(phone, state, data, consented):
+def save_session(phone: str, state: int, data: dict, consented: int):
     now = datetime.utcnow().isoformat()
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
+    conn = get_db()
+    conn.execute("""
         INSERT INTO sessions(phone, state, data, consented, created_at, updated_at)
         VALUES(?,?,?,?,?,?)
         ON CONFLICT(phone) DO UPDATE SET state=excluded.state, data=excluded.data,
         consented=excluded.consented, updated_at=excluded.updated_at
     """, (phone, state, json.dumps(data, ensure_ascii=False), consented, now, now))
     conn.commit()
-    conn.close()
 
-def end_session(phone):
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM sessions WHERE phone = ?", (phone,))
+def end_session(phone: str):
+    conn = get_db()
+    conn.execute("DELETE FROM sessions WHERE phone = ?", (phone,))
     conn.commit()
-    conn.close()
 
 def store_response(phone, data, risk_level, ga_weeks):
     now = datetime.utcnow().isoformat()
-    conn = db()
-    cur = conn.cursor()
-    cur.execute("""
+    conn = get_db()
+    conn.execute("""
         INSERT INTO responses(phone, data, risk_level, ga_weeks, created_at)
         VALUES(?,?,?,?,?)
     """, (phone, json.dumps(data, ensure_ascii=False), risk_level, ga_weeks, now))
     conn.commit()
-    conn.close()
 
-def twiml(message):
+def twiml(message: str):
     r = MessagingResponse()
     r.message(message)
     return Response(str(r), mimetype="application/xml")
@@ -564,8 +581,13 @@ def not_found(e):
     return render_template("404.html"), 404
 
 # ---------------------------------------------------------------------
-# Webhook (Twilio -> WhatsApp) — com anti-trava e repetição de pergunta
+# Webhook (Twilio -> WhatsApp) — rápido e resiliente
 # ---------------------------------------------------------------------
+GREETINGS = {
+    "oi", "olá", "ola", "bom dia", "boa tarde", "boa noite",
+    "hello", "hi", "hey", "eae", "e aí"
+}
+
 @app.post("/whatsapp")
 def whatsapp_webhook():
     incoming = request.form
@@ -576,7 +598,7 @@ def whatsapp_webhook():
     up = body.upper()
     low = body.lower().strip()
 
-    # Commands
+    # Commands (sem DB pesado quando possível)
     if up in ("SAIR", "FIM"):
         end_session(phone)
         return twiml("Conversa encerrada. Obrigado por participar! Em emergência, 192 (SAMU).")
@@ -596,8 +618,8 @@ def whatsapp_webhook():
     data = json.loads(sess["data"] or "{}")
     consented = sess["consented"] == 1
 
-    # Atalhos de FAQ (não mudam o estado)
-    if up.startswith("?") or any(k in body.lower() for k in [
+    # FAQ rápidos (não alteram estado)
+    if up.startswith("?") or any(k in low for k in [
         "alimentação","vacina","sinais de alerta","consultas","exames",
         "diabetes","pressão","prematuro","primeira consulta","sintomas","faixa etária"
     ]):
@@ -615,12 +637,11 @@ def whatsapp_webhook():
         else:
             return twiml("Para iniciar, digite *ACEITO*. Para sair, digite SAIR.")
 
-    # Saudações comuns → repete a pergunta atual (evita sensação de travado)
-    GREETINGS = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "hello", "hi"}
+    # Saudações → repete pergunta atual
     if low in GREETINGS:
         return twiml(QUESTIONS.get(state, "Vamos continuar."))
 
-    # Estado especial: repetir a pergunta corrente
+    # Repetir pergunta corrente
     if up == "CONTINUAR":
         return twiml(QUESTIONS.get(state, "Vamos continuar."))
 
@@ -634,7 +655,7 @@ def whatsapp_webhook():
         elif state == 2:
             try:
                 idade = int(body)
-                if idade < 10 or idade > 60:
+                if not (10 <= idade <= 60):
                     return twiml("Informe uma *idade válida* (ex.: 28).")
                 data["idade"] = idade
             except Exception:
@@ -651,7 +672,7 @@ def whatsapp_webhook():
             return twiml(QUESTIONS[4])
 
         elif state == 4:
-            ids = {s.strip() for s in body.replace(";",",").split(",") if s.strip()}
+            ids = {s.strip() for s in body.replace(";", ",").split(",") if s.strip()}
             valid = {"1","2","3","4","5","6","7"}
             if not ids or not ids.issubset(valid):
                 return twiml("Não entendi.\n\n" + QUESTIONS[4])
@@ -660,7 +681,7 @@ def whatsapp_webhook():
             return twiml(QUESTIONS[5])
 
         elif state == 5:
-            ids = {s.strip() for s in body.replace(";",",").split(",") if s.strip()}
+            ids = {s.strip() for s in body.replace(";", ",").split(",") if s.strip()}
             valid = {"1","2","3","4"}
             if not ids or not ids.issubset(valid):
                 return twiml("Não entendi.\n\n" + QUESTIONS[5])
@@ -671,7 +692,7 @@ def whatsapp_webhook():
         elif state == 6:
             try:
                 consultas = int(body)
-                if consultas < 0 or consultas > 50:
+                if not (0 <= consultas <= 50):
                     return twiml("Informe um número *válido* de consultas (ex.: 3).")
                 data["consultas_qtd"] = consultas
             except Exception:
@@ -700,10 +721,7 @@ def whatsapp_webhook():
                 if w is None:
                     return twiml("Não entendi.\n\n" + QUESTIONS[8])
                 data["peso"] = w
-            if data.get("peso") and data.get("altura"):
-                data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
-            else:
-                data["imc"] = None
+            data["imc"] = round(data["peso"] / (data["altura"]**2), 1) if (data.get("peso") and data.get("altura")) else None
             save_session(phone, 9, data, 1)
             return twiml(QUESTIONS[9])
 
@@ -715,10 +733,7 @@ def whatsapp_webhook():
                 if h is None:
                     return twiml("Não entendi.\n\n" + QUESTIONS[9])
                 data["altura"] = h
-            if data.get("peso") and data.get("altura"):
-                data["imc"] = round(data["peso"] / (data["altura"]**2), 1)
-            else:
-                data["imc"] = None
+            data["imc"] = round(data["peso"] / (data["altura"]**2), 1) if (data.get("peso") and data.get("altura")) else None
             save_session(phone, 10, data, 1)
             return twiml(QUESTIONS[10])
 
@@ -787,18 +802,11 @@ def whatsapp_webhook():
 def export_csv():
     import csv, io
     sep = (request.args.get("sep") or ";").strip()
-    if sep.lower() == "tab":
-        delimiter = "\t"
-    elif sep in [",", ";", "|"]:
-        delimiter = sep
-    else:
-        delimiter = ";"
+    delimiter = "\t" if sep.lower() == "tab" else (sep if sep in [",", ";", "|"] else ";")
 
-    conn = db()
-    cur = conn.cursor()
+    cur = get_db().cursor()
     cur.execute("SELECT id, phone, data, risk_level, ga_weeks, created_at FROM responses ORDER BY id DESC")
     rows = cur.fetchall()
-    conn.close()
 
     output = io.StringIO(newline="")
     writer = csv.writer(output, delimiter=delimiter, lineterminator="\n")
@@ -833,4 +841,6 @@ def health():
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
+    # Para produção, rode com gunicorn (múltiplos workers) para reduzir latência:
+    # gunicorn -w 2 -k gthread -t 30 -b 0.0.0.0:$PORT app:app
     app.run(host="0.0.0.0", port=port)
