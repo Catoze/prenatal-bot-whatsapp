@@ -10,87 +10,84 @@ from flask import Flask, request, Response, render_template
 from twilio.twiml.messaging_response import MessagingResponse
 from dotenv import load_dotenv
 
-# ============================================================
-# Setup básico
-# ============================================================
+# =========================
+# Setup
+# =========================
 load_dotenv()
 app = Flask(__name__, template_folder="templates")
 app.config["JSON_AS_ASCII"] = False
-app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024  # evita payloads gigantes
+
 DB_PATH = os.getenv("DB_PATH", "prenatal.db")
+PORT = int(os.getenv("PORT", "5000"))
 TWILIO_DEBUG = os.getenv("TWILIO_DEBUG", "1") == "1"
+LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").lower()  # deixe vazio p/ máxima velocidade
+USE_LLM_ONLY_WITH_QMARK = True
 
 def log(*args):
     if TWILIO_DEBUG:
         print("[WHATSAPP]", *args, flush=True)
 
-# ============================================================
-# SQLite rápido e resiliente
-# ============================================================
+# =========================
+# SQLite rápido
+# =========================
 def db():
     conn = sqlite3.connect(
         DB_PATH,
         timeout=3.0,
         check_same_thread=False,
-        isolation_level=None,  # autocommit (menos lock)
+        isolation_level=None,  # autocommit
     )
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
-    # PRAGMAs por conexão
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
     cur.execute("PRAGMA temp_store=MEMORY;")
-    cur.execute("PRAGMA cache_size=-16000;")   # ~16MB
+    cur.execute("PRAGMA cache_size=-16000;")
     cur.execute("PRAGMA busy_timeout=3000;")
     cur.execute("PRAGMA foreign_keys=ON;")
     return conn
 
 def init_db():
-    conn = db()
-    cur = conn.cursor()
+    conn = db(); cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            phone TEXT PRIMARY KEY,
-            state INTEGER NOT NULL,
-            data  TEXT    NOT NULL,
-            consented INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS sessions(
+          phone TEXT PRIMARY KEY,
+          state INTEGER NOT NULL,
+          data  TEXT NOT NULL,
+          consented INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
         );
     """)
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS responses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            phone TEXT NOT NULL,
-            data  TEXT NOT NULL,
-            risk_level TEXT NOT NULL,
-            ga_weeks INTEGER,
-            created_at TEXT NOT NULL
+        CREATE TABLE IF NOT EXISTS responses(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          phone TEXT NOT NULL,
+          data  TEXT NOT NULL,
+          risk_level TEXT NOT NULL,
+          ga_weeks INTEGER,
+          created_at TEXT NOT NULL
         );
     """)
     try:
         cur.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts
-            USING fts5(
-                title,
-                body,
-                tags,
-                tokenize = 'unicode61 remove_diacritics 2'
-            );
+          CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts
+          USING fts5(
+            title, body, tags,
+            tokenize='unicode61 remove_diacritics 2'
+          );
         """)
     except sqlite3.OperationalError:
         pass
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
 init_db()
 
-# ============================================================
-# FAQ / RAG local (FTS5) — rápido
-# ============================================================
-def _t(s):  # minify
-    import re as _re
-    return _re.sub(r"[ \t]+\n", "\n", s.strip())
+# =========================
+# FAQ / RAG local
+# =========================
+def _t(s):
+    return re.sub(r"[ \t]+\n", "\n", s.strip())
 
 FAQ_TOPICS = {
     ("primeira consulta", "primeira vez", "começar", "iniciar"): _t("""
@@ -149,7 +146,6 @@ FAQ_TOPICS = {
         • Não é diagnóstico; significa acompanhamento mais próximo e atento
     """),
 }
-
 FAQ_MENU = _t("""
 *Ajuda/Informações* — você pode enviar `? tema` ou escrever em linguagem natural (ex.: "dor de cabeça", "movimentos do bebê").
 • `? primeira consulta` • `? consultas` • `? alimentação`
@@ -158,9 +154,11 @@ FAQ_MENU = _t("""
 • `? parto prematuro` • `? faixa etária`
 (Use `MENU` para ver esta lista; `CONTINUAR` volta ao questionário.)
 """)
-
 FAQ_TRIGGER_WORDS = tuple(sorted({w for ks in FAQ_TOPICS for w in ks}, key=len, reverse=True))
+
 TOKEN_RE = re.compile(r"\w{3,}", re.UNICODE)
+BP_RE  = re.compile(r"(\d{2,3})\s*/\s*(\d{1,3})")
+NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
 
 def ensure_kb_seed():
     try:
@@ -188,14 +186,8 @@ def kb_search_cached(query_norm: str, k: int) -> tuple:
     try:
         conn = db(); cur = conn.cursor()
         sql = """
-            SELECT title,
-                   snippet(kb_fts, 1, '*', '*', '…', 10) AS snip,
-                   body,
-                   bm25(kb_fts) AS score
-            FROM kb_fts
-            WHERE kb_fts MATCH ?
-            ORDER BY score
-            LIMIT ?
+            SELECT title, snippet(kb_fts, 1, '*', '*', '…', 10) AS snip, body, bm25(kb_fts) AS score
+            FROM kb_fts WHERE kb_fts MATCH ? ORDER BY score LIMIT ?
         """
         rows = list(cur.execute(sql, (query_norm, k)))
         conn.close()
@@ -210,15 +202,6 @@ def kb_search_raw(query: str, k: int = 3):
     rows = kb_search_cached(q, k)
     return [{"title": r[0], "snippet": r[1] or r[2], "body": r[2], "score": r[3]} for r in rows]
 
-# (LLM opcional — desligado por padrão para não atrasar webhook)
-LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "").lower()
-USE_LLM_ONLY_WITH_QMARK = True
-SAFETY_SYSTEM = (
-    "Você é um assistente educativo em saúde materna. Responda em português, "
-    "curto e claro, sem diagnosticar nem prescrever. Em sinais de alerta, "
-    "oriente procurar serviço de saúde/SAMU 192."
-)
-
 def llm_summarize(question: str, passages: list[str]) -> str | None:
     if not passages: return None
     try:
@@ -226,9 +209,11 @@ def llm_summarize(question: str, passages: list[str]) -> str | None:
             from openai import OpenAI
             client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
             prompt = (
-                f"{SAFETY_SYSTEM}\n\nPERGUNTA:\n{question}\n\n"
-                f"FONTES:\n- " + "\n- ".join(passages) +
-                "\n\nResponda objetivamente (bullets quando útil)."
+                "Você é um assistente educativo em saúde materna. Responda em português, "
+                "curto e claro, sem diagnosticar nem prescrever. Em sinais de alerta, "
+                "oriente procurar serviço de saúde/SAMU 192.\n\n"
+                f"PERGUNTA:\n{question}\n\n"
+                f"FONTES:\n- " + "\n- ".join(passages) + "\n\nResponda objetivamente (bullets quando útil)."
             )
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -243,9 +228,11 @@ def llm_summarize(question: str, passages: list[str]) -> str | None:
             genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
             model = genai.GenerativeModel("gemini-1.5-flash")
             prompt = (
-                f"{SAFETY_SYSTEM}\n\nPERGUNTA:\n{question}\n\n"
-                f"FONTES:\n- " + "\n- ".join(passages) +
-                "\n\nResponda objetivamente (bullets quando útil)."
+                "Você é um assistente educativo em saúde materna. Responda em português, "
+                "curto e claro, sem diagnosticar nem prescrever. Em sinais de alerta, "
+                "oriente procurar serviço de saúde/SAMU 192.\n\n"
+                f"PERGUNTA:\n{question}\n\n"
+                f"FONTES:\n- " + "\n- ".join(passages) + "\n\nResponda objetivamente (bullets quando útil)."
             )
             resp = model.generate_content(prompt)
             return (getattr(resp, "text", "") or "").strip()
@@ -263,20 +250,18 @@ def answer_faq(text: str, data: dict | None = None) -> str | None:
             return msg
 
     hits = kb_search_raw(t, k=3)
-    if not hits:
-        return None
+    if not hits: return None
 
     if LLM_PROVIDER and (starts_with_q or not USE_LLM_ONLY_WITH_QMARK):
         summary = llm_summarize(text, [h["body"] for h in hits])
-        if summary:
-            return summary
+        if summary: return summary
 
     bullets = [f"• *{h['title'].capitalize()}*: {h['snippet']}" for h in hits]
     return "*Informações relacionadas:*\n" + "\n".join(bullets)
 
-# ============================================================
-# Fluxo do questionário
-# ============================================================
+# =========================
+# Fluxo / helpers
+# =========================
 SEVERE_SYMPTOM_IDS = {"1","2","3","4","6"}
 
 WELCOME = (
@@ -286,48 +271,35 @@ WELCOME = (
     "conforme a LGPD, responda: *ACEITO*.\n\n"
     "Comandos: *MENU*, *CONTINUAR*, *REINICIAR*, *FIM*, *SAIR*."
 )
-
 CONSENT_CONFIRMED = "Obrigado. Consentimento registrado. Vamos começar com algumas perguntas rápidas."
-
 QUESTIONS = {
     1: "1) Para preservar a privacidade, informe apenas *iniciais* do seu nome (ex.: A.R.M.).",
     2: "2) Qual sua *idade* em anos? (ex.: 28)",
-    3: (
-        "3) Informe a *data da última menstruação (DUM)* em *DD/MM/AAAA*\n"
-        "   *ou* digite apenas as *semanas de gestação* (ex.: 22)."
-    ),
-    4: (
-        "4) Você apresenta algum(s) *sintoma(s) agora*? Responda com os números (ex.: 1,3):\n"
+    3: ("3) Informe a *data da última menstruação (DUM)* em *DD/MM/AAAA*\n"
+        "   *ou* digite apenas as *semanas de gestação* (ex.: 22)."),
+    4: ("4) Você apresenta algum(s) *sintoma(s) agora*? Responda com os números (ex.: 1,3):\n"
         "1 Sangramento vaginal\n"
         "2 Dor abdominal intensa\n"
         "3 Febre (≥ 38°C)\n"
         "4 Dor de cabeça forte / visão turva / inchaço súbito\n"
         "5 Náusea/vômito persistente\n"
         "6 Ausência de movimentos fetais (> 28s)\n"
-        "7 Nenhum dos anteriores"
-    ),
-    5: (
-        "5) Possui alguma *condição de saúde*? (números, ex.: 1,4)\n"
+        "7 Nenhum dos anteriores"),
+    5: ("5) Possui alguma *condição de saúde*? (números, ex.: 1,4)\n"
         "1 Hipertensão\n"
         "2 Diabetes\n"
         "3 Infecção urinária atual\n"
-        "4 Nenhuma"
-    ),
+        "4 Nenhuma"),
     6: "6) Quantas *consultas de pré-natal* você já realizou nesta gestação? (ex.: 3)",
-    7: (
-        "7) Você consegue informar sua *pressão arterial* agora?\n"
-        "   Envie como *12x8*, *12/8*, *12 8* ou *120/80* (ou digite *PULAR*)."
-    ),
+    7: ("7) Você consegue informar sua *pressão arterial* agora?\n"
+        "   Envie como *12x8*, *12/8*, *12 8* ou *120/80* (ou digite *PULAR*)."),
     8: "8) Informe seu *peso em kg* (ex.: 70). Se não souber, digite *PULAR*.",
     9: "9) Informe sua *altura em metros* (ex.: 1.60). Se não souber, digite *PULAR*.",
     10: "10) Você usa *tabaco* ou *álcool* atualmente? Responda *1* Sim ou *2* Não.",
 }
-
 FINAL_MSG = "Obrigado. Avaliando suas respostas…"
-EDU_MSG = (
-    "Deseja receber *material educativo* (dicas personalizadas, sinais de alerta e calendário de consultas)?\n"
-    "Responda 1 para *Sim* ou 2 para *Não*."
-)
+EDU_MSG = ("Deseja receber *material educativo* (dicas personalizadas, sinais de alerta e calendário de consultas)?\n"
+           "Responda 1 para *Sim* ou 2 para *Não*.")
 ALERTA_BASE = (
     "*Sinais de alerta* — procurar serviço imediatamente / *192 SAMU*:\n"
     "• Sangramento vaginal\n"
@@ -336,10 +308,7 @@ ALERTA_BASE = (
     "• Dor de cabeça intensa/visão turva/inchaço súbito\n"
     "• Ausência de movimentos fetais após 28s"
 )
-
-# Regex pré-compiladas
-BP_RE  = re.compile(r"(\d{2,3})\s*/\s*(\d{1,3})")
-NUM_RE = re.compile(r"(\d+(?:\.\d+)?)")
+GREETINGS = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "hello", "hi"}
 
 def parse_dum_or_weeks(text):
     text = text.strip()
@@ -481,7 +450,6 @@ def classify_risk(record):
         reasons.append("IMC elevado (≥30).")
     if habitos == "sim":
         reasons.append("Uso de tabaco/álcool (risco gestacional).")
-
     if reasons:
         return ("PRIORITÁRIO", "; ".join(reasons) + " Para saber mais, envie `? faixa etária` ou `? pressão alta`. Orientar avaliação em breve (hoje/amanhã).")
     return ("ROTINA", "Sem sinais de alerta no momento. Manter acompanhamento de pré-natal e orientações gerais.")
@@ -525,15 +493,12 @@ def twiml(message):
     r.message(message)
     return Response(str(r), mimetype="application/xml")
 
-# ============================================================
-# Home & erros
-# ============================================================
+# =========================
+# Rotas
+# =========================
 @app.get("/")
 def index():
-    return (
-        "Chatbot Pré-Natal (WhatsApp via Twilio). Endpoints: "
-        "/health (GET), /whatsapp (POST - webhook), /export.csv (GET)."
-    )
+    return "Chatbot Pré-Natal: /health, /whatsapp (POST), /whatsapp-test (POST), /export.csv"
 
 @app.get("/health")
 def health():
@@ -543,24 +508,28 @@ def health():
 def not_found(e):
     return render_template("404.html"), 404
 
-# ============================================================
-# Webhook WhatsApp (Twilio -> seu servidor)
-# ============================================================
-GREETINGS = {"oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "hello", "hi"}
+# --- webhook de TESTE (responde sempre) ---
+@app.post("/whatsapp-test")
+def whatsapp_test():
+    incoming = request.form
+    body = (incoming.get("Body") or "").strip()
+    from_raw = incoming.get("From") or ""
+    phone = from_raw.replace("whatsapp:", "")
+    log("TEST IN:", {"from": phone, "body": body})
+    return twiml("✅ Webhook OK. Use /whatsapp para o fluxo completo. Envie *ACEITO* para começar.")
 
+# --- webhook principal ---
 @app.post("/whatsapp")
 def whatsapp_webhook():
-    # Twilio sempre manda application/x-www-form-urlencoded
     incoming = request.form
     body = (incoming.get("Body") or "").strip()
     from_raw = incoming.get("From") or ""
     phone = from_raw.replace("whatsapp:", "")
     up  = body.upper()
     low = body.lower()
-
     log("IN:", {"from": phone, "body": body})
 
-    # Comandos universais
+    # Comandos
     if up in ("SAIR", "FIM"):
         end_session(phone)
         return twiml("Conversa encerrada. Obrigado por participar! Em emergência, 192 (SAMU).")
@@ -571,17 +540,17 @@ def whatsapp_webhook():
     if up == "MENU":
         return twiml(FAQ_MENU)
 
-    # Cria sessão ao primeiro contato
+    # Sessão
     sess = get_session(phone)
     if not sess:
         save_session(phone, 0, {}, 0)
         return twiml(WELCOME)
 
-    state     = int(sess["state"])
-    data      = json.loads(sess["data"] or "{}")
+    state = int(sess["state"])
+    data = json.loads(sess["data"] or "{}")
     consented = sess["consented"] == 1
 
-    # FAQ rápido (não muda estado)
+    # FAQ rápido
     if up.startswith("?") or any(w in low for w in FAQ_TRIGGER_WORDS):
         ans = answer_faq(body, data)
         if ans:
@@ -596,11 +565,11 @@ def whatsapp_webhook():
             return twiml(CONSENT_CONFIRMED + "\n\n" + QUESTIONS[1])
         return twiml("Para iniciar, digite *ACEITO*. Para sair, digite SAIR.")
 
-    # Saudações / continuar
+    # Saudações/CONTINUAR → repete pergunta atual
     if low in GREETINGS or up == "CONTINUAR":
         return twiml(QUESTIONS.get(state, "Vamos continuar."))
 
-    # Máquina de estados
+    # State machine
     try:
         if state == 1:
             data["iniciais"] = body[:20].strip()
@@ -697,11 +666,9 @@ def whatsapp_webhook():
             store_response(phone, data, risk_level, data.get("ga_weeks"))
             save_session(phone, 11, data, 1)
 
-            msg = (
-                f"{FINAL_MSG}\n\n"
-                f"*Classificação:* {risk_level}\n"
-                f"*Justificativa:* {rationale}\n"
-            )
+            msg = (f"{FINAL_MSG}\n\n"
+                   f"*Classificação:* {risk_level}\n"
+                   f"*Justificativa:* {rationale}\n")
             if risk_level == "EMERGENTE":
                 msg += "➡️ Procure um serviço de *emergência agora* ou ligue *192 (SAMU)*.\n"
             elif risk_level == "PRIORITÁRIO":
@@ -741,15 +708,12 @@ def whatsapp_webhook():
         else:
             end_session(phone)
             return twiml("Sessão reiniciada. Digite *ACEITO* para iniciar.")
-
     except Exception as e:
         log("ERRO:", repr(e))
         end_session(phone)
         return twiml("Ocorreu um erro inesperado. Tente novamente mais tarde.")
 
-# ============================================================
-# Export CSV
-# ============================================================
+# Export
 @app.get("/export.csv")
 def export_csv():
     import csv, io
@@ -791,10 +755,7 @@ def export_csv():
     return Response(csv_bytes, mimetype="text/csv",
                     headers={"Content-Disposition":"attachment; filename=prenatal_export.csv"})
 
-# ============================================================
 # Boot
-# ============================================================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    # Em produção, use gunicorn:  gunicorn app:app --workers 3 --threads 2 --timeout 30
-    app.run(host="0.0.0.0", port=port)
+    # Em prod, prefira: gunicorn app:app --workers 3 --threads 2 --timeout 30
+    app.run(host="0.0.0.0", port=PORT)
