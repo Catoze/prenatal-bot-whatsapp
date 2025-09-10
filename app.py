@@ -635,11 +635,7 @@ if __name__ == "__main__":
 
 @app.route("/whatsapp-test", methods=["GET", "POST"])
 def whatsapp_test():
-    incoming = request.values
-    body = (incoming.get("Body") or "").strip()
-    from_raw = incoming.get("From") or ""
-    phone = from_raw.replace("whatsapp:", "")
-    print("TEST IN:", phone, body, flush=True)
-    return twiml("✅ Webhook OK. Envie *ACEITO* para começar.")
-}
+    body = (request.values.get("Body") or "ping").strip()
+    frm  = (request.values.get("From") or "whatsapp:+000").replace("whatsapp:", "")
+    return twiml(f"✅ Webhook OK. Echo: '{body}' de {frm}")
 
